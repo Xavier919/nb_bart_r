@@ -40,7 +40,7 @@ def load_and_prepare_data():
                     'pi', 'fi', 'fli', 'fri', 'fti', 'cli', 'cri', 'cti','total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
                     'commercial', 'number_of_', 'of_exclusi', 'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r',
                     'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
-                    'parking', 'north_veh', 'north_ped', 'east_veh', 'east_ped', 'south_veh', 'south_ped', 'west_veh', 'west_ped',]
+                    'parking', 'north_veh', 'north_ped', 'east_veh', 'east_ped', 'south_veh', 'south_ped', 'west_veh', 'west_ped']
     
 
     # Check which columns actually exist in the data
@@ -51,6 +51,11 @@ def load_and_prepare_data():
     X_base = data[feature_cols].fillna(0)
     X_spatial = data[spatial_cols].fillna(0)
     
+    # Apply quadratic transformation to specified variables
+    for col in ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi']:
+        if col in X_base.columns:
+            X_base[f'{col}_squared'] = X_base[col] ** 2
+
     # Calculate additional spatial features if x and y are available
     if all(col in X_spatial.columns for col in ['x', 'y']):
         # 1. Normalize x and y coordinates
@@ -216,8 +221,6 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
         print(f"Fold {i} - MSE: {mean_squared_error(y_test, fold_results.y_pred_mean)}")
         print(f"Fold {i} - RMSE: {np.sqrt(mean_squared_error(y_test, fold_results.y_pred_mean))}")
         
-        # Save results for this fold
-        # Removed: save_results(int_no.iloc[test_idx], y_test, fold_results.y_pred_mean, pi.iloc[test_idx], f"bart_fold_{i}")
     
     # Calculate averages
     avg_metrics = all_metrics[['mae', 'mse', 'rmse']].mean()
