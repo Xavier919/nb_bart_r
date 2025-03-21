@@ -3,6 +3,8 @@ import numpy as np
 import os
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.linear_model import LassoCV
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
@@ -35,13 +37,12 @@ def load_and_prepare_data():
     
     # Base features (non-spatial)
     feature_cols = ['ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'traffic_10000', 'ln_cti', 'ln_cli', 'ln_cri',
-                  'total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
-                  'commercial', 'number_of_', 'of_exclusi', 'curb_exten',
-                  'median', 'all_pedest', 'half_phase', 'new_half_r',
-                  'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re',
-                  'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
-                  'parking']
+                    'pi', 'fi', 'fli', 'fri', 'fti', 'cli', 'cri', 'cti','total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
+                    'commercial', 'number_of_', 'of_exclusi', 'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r',
+                    'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
+                    'parking', 'north_veh', 'north_ped', 'east_veh', 'east_ped', 'south_veh', 'south_ped', 'west_veh', 'west_ped',]
     
+
     # Check which columns actually exist in the data
     feature_cols = [col for col in feature_cols if col in data.columns]
     spatial_cols = [col for col in spatial_cols if col in data.columns]
@@ -75,10 +76,28 @@ def load_and_prepare_data():
     
     return {
         'X': X_features, 
+        'X_non_spatial': X_base,  # Add non-spatial features separately
+        'X_spatial': X_spatial,   # Add spatial features separately
         'y': data['acc'], 
         'int_no': data['int_no'],
         'pi': data['pi']
     }
+
+
+def select_features_with_lasso(X, y):
+    # Standardize features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Fit Lasso model with cross-validation to find optimal alpha
+    lasso = LassoCV(cv=5, random_state=42)
+    lasso.fit(X_scaled, y)
+    
+    # Select features with non-zero coefficients
+    selected_features = X.columns[lasso.coef_ != 0]
+    print(f"Selected {len(selected_features)} features: {list(selected_features)}")
+    
+    return selected_features
 
 
 def run_bart_model(X_train, y_train, X_test, y_test):
@@ -107,7 +126,30 @@ def run_bart_model(X_train, y_train, X_test, y_test):
     return results
 
 
-def run_cross_validation(X, y, k=5):
+def save_results(int_no, y_true, y_pred, pi, model_name):
+    results_path = "results"
+    os.makedirs(results_path, exist_ok=True)
+    
+    # Create results DataFrame
+    results = pd.DataFrame({
+        'int_no': int_no,
+        'true_counts': y_true,
+        'pred_counts': y_pred,
+        'true_rate': y_true / pi,
+        'pred_rate': y_pred / pi,
+        'pi': pi
+    })
+    
+    # Save prediction summary
+    results.to_csv(os.path.join(results_path, f"{model_name}_cv_results.csv"), index=False)
+    
+    # Create and save intersection ranking
+    rankings = results[['int_no', 'pred_counts']].sort_values(by='pred_counts', ascending=False)
+    rankings['ranking'] = range(1, len(rankings) + 1)
+    rankings.to_csv(os.path.join(results_path, f"{model_name}_intersections_cv_ranking.csv"), index=False)
+
+
+def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
     # Create fold indices
     np.random.seed(42)
     kf = KFold(n_splits=k, shuffle=True, random_state=42)
@@ -115,19 +157,29 @@ def run_cross_validation(X, y, k=5):
     # Initialize lists to store results
     results_list = []
     all_metrics = pd.DataFrame(columns=['fold', 'mae', 'mse', 'rmse'])
+    combined_results = pd.DataFrame()  # New DataFrame to store combined results
     
     # For each fold
-    for i, (train_idx, test_idx) in enumerate(kf.split(X), 1):
+    for i, (train_idx, test_idx) in enumerate(kf.split(X_non_spatial), 1):
         print(f"\n========== Fold {i} ==========")
         
         # Create training and test sets
-        X_train = X.iloc[train_idx]
+        X_train_non_spatial = X_non_spatial.iloc[train_idx]
         y_train = y.iloc[train_idx]
-        X_test = X.iloc[test_idx]
+        X_test_non_spatial = X_non_spatial.iloc[test_idx]
         y_test = y.iloc[test_idx]
         
-        # Run BART model
-        fold_results = run_bart_model(X_train, y_train, X_test, y_test)
+        # Select features using Lasso on non-spatial features
+        selected_features = select_features_with_lasso(X_train_non_spatial, y_train)
+        X_train_selected = X_train_non_spatial[selected_features]
+        X_test_selected = X_test_non_spatial[selected_features]
+        
+        # Combine selected non-spatial features with all spatial features
+        X_train_combined = pd.concat([X_train_selected, X_spatial.iloc[train_idx]], axis=1)
+        X_test_combined = pd.concat([X_test_selected, X_spatial.iloc[test_idx]], axis=1)
+        
+        # Run BART model with combined features
+        fold_results = run_bart_model(X_train_combined, y_train, X_test_combined, y_test)
         
         # Debugging: Check the shapes
         print(f"y_test shape: {y_test.shape}, y_pred_mean shape: {fold_results.y_pred_mean.shape}")
@@ -139,6 +191,17 @@ def run_cross_validation(X, y, k=5):
         
         # Store results
         results_list.append(fold_results)
+        
+        # Combine results for this fold
+        fold_results_df = pd.DataFrame({
+            'int_no': int_no.iloc[test_idx],
+            'true_counts': y_test,
+            'pred_counts': fold_results.y_pred_mean,
+            'true_rate': y_test / pi.iloc[test_idx],
+            'pred_rate': fold_results.y_pred_mean / pi.iloc[test_idx],
+            'pi': pi.iloc[test_idx]
+        })
+        combined_results = pd.concat([combined_results, fold_results_df], ignore_index=True)
         
         # Add evaluation metrics to dataframe
         all_metrics = pd.concat([all_metrics, pd.DataFrame({
@@ -152,6 +215,9 @@ def run_cross_validation(X, y, k=5):
         print(f"Fold {i} - MAE: {mean_absolute_error(y_test, fold_results.y_pred_mean)}")
         print(f"Fold {i} - MSE: {mean_squared_error(y_test, fold_results.y_pred_mean)}")
         print(f"Fold {i} - RMSE: {np.sqrt(mean_squared_error(y_test, fold_results.y_pred_mean))}")
+        
+        # Save results for this fold
+        # Removed: save_results(int_no.iloc[test_idx], y_test, fold_results.y_pred_mean, pi.iloc[test_idx], f"bart_fold_{i}")
     
     # Calculate averages
     avg_metrics = all_metrics[['mae', 'mse', 'rmse']].mean()
@@ -172,10 +238,18 @@ def run_cross_validation(X, y, k=5):
     
     # Create a multi-panel plot
     g = sns.FacetGrid(all_metrics_long, col='variable', col_wrap=3, height=4)
-    g.map(sns.barplot, 'fold', 'value')
+    g.map(sns.barplot, 'fold', 'value', order=sorted(all_metrics_long['fold'].unique()))
     g.set_axis_labels('Fold', 'Value')
     g.set_titles('{col_name}')
     plt.tight_layout()
+    
+    # Save combined results
+    combined_results.to_csv(os.path.join("results", "bart_combined_cv_results.csv"), index=False)
+    
+    # Create and save combined intersection ranking
+    combined_rankings = combined_results[['int_no', 'pred_counts']].sort_values(by='pred_counts', ascending=False)
+    combined_rankings['ranking'] = range(1, len(combined_rankings) + 1)
+    combined_rankings.to_csv(os.path.join("results", "bart_combined_intersections_cv_ranking.csv"), index=False)
     
     return {
         'results_per_fold': results_list,
@@ -188,7 +262,7 @@ def main():
     data = load_and_prepare_data()
     
     # Run 5-fold cross validation
-    cv_results = run_cross_validation(data['X'], data['y'], k=5)
+    cv_results = run_cross_validation(data['X_non_spatial'], data['X_spatial'], data['y'], data['int_no'], data['pi'], k=5)
     
     # Return results
     return cv_results
