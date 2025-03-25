@@ -268,7 +268,11 @@ class NegativeBinomial:
         
     def _next_omega(self, r, psi):
         """ Updates omega. """
-        omega = self._pg_rnd(self.data.y + r, psi)
+        # Clip psi to prevent extreme values that could cause numerical problems
+        psi_clipped = np.clip(psi, -50, 50)
+        omega = self._pg_rnd(self.data.y + r, psi_clipped)
+        # Add small epsilon to omega to prevent division by zero
+        omega = np.maximum(omega, 1e-10)  # Ensure omega is never too close to zero
         Omega = np.diag(omega)
         z = (self.data.y - r) / 2 / omega
         return omega, Omega, z
@@ -369,7 +373,7 @@ class NegativeBinomial:
         return h
     
     @staticmethod
-    @jit
+    @jit(nopython=True)
     def _next_L(y, r, F):
         """ Updates L. """
         N = y.shape[0]
@@ -386,8 +390,12 @@ class NegativeBinomial:
     @staticmethod
     def _next_r(r0, L, h, psi):
         """ Updates r. """
-        sum_p = np.sum(np.log1p(np.exp(psi)))
+        # Clip psi to avoid overflow in exp
+        psi_clipped = np.clip(psi, -50, 50)
+        sum_p = np.sum(np.log1p(np.exp(psi_clipped)))
         r = np.random.gamma(r0 + np.sum(L), 1 / (h + sum_p))
+        # Ensure r is positive and not too small
+        r = max(r, 1e-5)
         return r
     
     @staticmethod
