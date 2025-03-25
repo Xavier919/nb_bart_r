@@ -447,7 +447,7 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
     }
 
 
-def plot_results(combined_results, X_spatial):
+def plot_results(combined_results, X_spatial, int_no=None):
     """Plot various visualizations of the model results"""
     results_path = "results"
     os.makedirs(results_path, exist_ok=True)
@@ -465,18 +465,22 @@ def plot_results(combined_results, X_spatial):
     
     # Plot spatial distribution of accidents
     if 'x' in X_spatial.columns and 'y' in X_spatial.columns:
-        # Create a mapping of int_no to spatial coordinates - fixed to use int_no from combined_results
-        unique_int_nos = combined_results['int_no'].unique()
-        
         # Create a DataFrame with int_no, x, y by merging information
         spatial_results = pd.DataFrame()
         
         # Group by int_no and calculate mean predicted counts
         pred_by_int = combined_results.groupby('int_no')['pred_counts'].mean().reset_index()
         
+        # Use provided int_no if available and not already in X_spatial
+        if 'int_no' not in X_spatial.columns and int_no is not None:
+            X_spatial_with_int = X_spatial.copy()
+            X_spatial_with_int['int_no'] = int_no.values
+        else:
+            X_spatial_with_int = X_spatial
+        
         # Only proceed if we can match int_no with spatial coordinates
-        if 'int_no' in X_spatial.columns:
-            spatial_mapping = X_spatial[['int_no', 'x', 'y']].drop_duplicates('int_no').set_index('int_no')
+        if 'int_no' in X_spatial_with_int.columns:
+            spatial_mapping = X_spatial_with_int[['int_no', 'x', 'y']].drop_duplicates('int_no').set_index('int_no')
             
             # Merge spatial coordinates with predictions
             spatial_results = pd.merge(
@@ -486,10 +490,10 @@ def plot_results(combined_results, X_spatial):
             )
         else:
             # Try to match by index position if int_no values are available in order
-            if hasattr(X_spatial, 'index') and X_spatial.index.name == 'int_no':
+            if hasattr(X_spatial_with_int, 'index') and X_spatial_with_int.index.name == 'int_no':
                 spatial_results = pd.merge(
                     pred_by_int,
-                    X_spatial.reset_index(),
+                    X_spatial_with_int.reset_index(),
                     on='int_no', how='inner'
                 )
             else:
@@ -528,10 +532,8 @@ def main():
     combined_results_path = os.path.join("results", "nb_model_combined_cv_results.csv")
     if os.path.exists(combined_results_path):
         combined_results = pd.read_csv(combined_results_path)
-        # Generate plots
-        plot_results(combined_results, data['X_spatial'])
-    else:
-        print("Combined results file not found. Skipping plot generation.")
+        # Pass int_no as an additional parameter to plot_results
+        plot_results(combined_results, data['X_spatial'], data['int_no'])
     
     # Return results
     return cv_results

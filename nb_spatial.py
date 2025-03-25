@@ -559,7 +559,7 @@ class NegativeBinomial:
                 else:
                     mh_step -= options.mh_correct
                      
-            # Display progress
+            # Display sampling progress
             if ((i+1) % options.disp) == 0:  
                 if (i+1) > options.nBurn:
                     sample_state = 'sampling'
