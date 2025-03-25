@@ -946,18 +946,17 @@ def load_and_prepare_data():
         if col in X_base.columns:
             X_base[f'{col}_squared'] = X_base[col] ** 2
 
-    # Prepare random effects structure for borough
-    # Create a design matrix for random effects with a single borough indicator (1.0)
-    X_rnd = None
-    if 'borough' in data.columns:
-        # One-hot encoding for random effects
-        # We need a single column with 1.0 for each observation
-        X_rnd = np.ones((len(data), 1))
-        # Also store the borough codes for later use
-        X_spatial['borough_code'] = data['borough_code']
+    # Instead of creating random effects for borough, create dummy variables
+    X_rnd = None  # We won't use random effects anymore
     
-    # Combine all features for fixed effects (without borough dummies)
-    X_features = pd.concat([X_base, X_spatial], axis=1)
+    # Create dummy variables for borough if it exists
+    borough_dummies = None
+    if 'borough' in data.columns:
+        borough_dummies = pd.get_dummies(data['borough'], prefix='borough')
+        # Add borough dummies to X_features
+        X_features = pd.concat([X_base, X_spatial, borough_dummies], axis=1)
+    else:
+        X_features = pd.concat([X_base, X_spatial], axis=1)
     
     return {
         'X': X_features, 
@@ -966,8 +965,9 @@ def load_and_prepare_data():
         'y': data['acc'], 
         'int_no': data['int_no'],
         'pi': data['pi'],
-        'X_rnd': X_rnd,
-        'borough_codes': data['borough_code'] if 'borough' in data.columns else None
+        'X_rnd': None,  # No random effects
+        'borough_codes': None,  # No borough codes needed
+        'borough_dummies': borough_dummies  # Return borough dummies separately
     }
 
 
@@ -1029,13 +1029,19 @@ def create_spatial_weight_matrix(X_spatial):
     return W
 
 
-def select_features_with_lasso(X, y):
+def select_features_with_lasso(X, y, borough_dummies=None):
     """
     Select features using Lasso regression
-    Always keeps specified important features regardless of Lasso selection
+    Always keeps specified important features and borough dummies
     """
     # List of features to always keep
-    important_features = ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi', 'ln_cti_squared', 'ln_cri_squared', 'ln_cli_squared', 'ln_pi_squared', 'ln_fri_squared', 'ln_fli_squared', 'ln_fi_squared']
+    important_features = ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi', 
+                         'ln_cti_squared', 'ln_cri_squared', 'ln_cli_squared', 'ln_pi_squared', 
+                         'ln_fri_squared', 'ln_fli_squared', 'ln_fi_squared']
+    
+    # Add borough dummy columns to important features if they exist
+    if borough_dummies is not None:
+        important_features.extend(borough_dummies.columns.tolist())
     
     # Filter to only include features that exist in the dataset
     important_features = [f for f in important_features if f in X.columns]
@@ -1060,7 +1066,7 @@ def select_features_with_lasso(X, y):
     return selected_features
 
 
-def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_codes_train=None):
+def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     """
     Run Negative Binomial model with fixed parameters, random effects for borough, and spatial correlation
     """
@@ -1068,16 +1074,8 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_co
     X_train_np = X_train.values.astype(np.float64)
     y_train_np = y_train.values.astype(np.int64)
     
-    # Setup random effects for borough if available
-    X_rnd_train = None
-    n_rnd = 0
-    if borough_codes_train is not None:
-        # Create a design matrix for random effects (1.0 for each observation)
-        X_rnd_train = np.ones((len(y_train), 1), dtype=np.float64)
-        n_rnd = 1  # One random effect (for borough)
-    
     # Create Data object for NegativeBinomial model
-    nb_data = Data(y=y_train_np, x_fix=X_train_np, x_rnd=X_rnd_train, W=W_train)
+    nb_data = Data(y=y_train_np, x_fix=X_train_np, x_rnd=None, W=W_train)
     
     # Initialize model
     nb_model = NegativeBinomial(nb_data, data_bart=None)
@@ -1099,10 +1097,10 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_co
     beta_Si0Inv = 1e-2 * np.eye(n_fix)
     
     # Random effects parameters (for borough)
-    mu_mu0 = np.zeros(n_rnd)
-    mu_Si0Inv = 1e-2 * np.eye(n_rnd) if n_rnd > 0 else np.eye(0)
+    mu_mu0 = np.zeros(0)
+    mu_Si0Inv = np.eye(0)
     nu = 3  # Degrees of freedom for inverse-Wishart
-    A = np.ones(n_rnd) if n_rnd > 0 else np.array([])
+    A = np.ones(0)
     
     # Spatial parameters
     sigma2_b0 = 1e-2
@@ -1113,8 +1111,8 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_co
     # Initialize parameters
     r_init = 5.0
     beta_init = np.zeros(n_fix)
-    mu_init = np.zeros(n_rnd)
-    Sigma_init = np.eye(n_rnd) if n_rnd > 0 else np.eye(0)
+    mu_init = np.zeros(0)
+    Sigma_init = np.eye(0)
     
     # Define ranking thresholds
     ranking_top_m_list = [10, 25, 50, 100]
@@ -1179,7 +1177,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_co
     return results
 
 
-def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, X_rnd=None, borough_codes=None, k=5):
+def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummies=None, k=5):
     """
     Run k-fold cross-validation with the Negative Binomial model
     """
@@ -1203,8 +1201,8 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, X_rnd=None, bo
     print(f"y shape: {y.shape}")
     print(f"int_no shape: {int_no.shape}")
     print(f"pi shape: {pi.shape}")
-    if borough_codes is not None:
-        print(f"borough_codes shape: {borough_codes.shape}")
+    if borough_dummies is not None:
+        print(f"borough_dummies shape: {borough_dummies.shape}")
     
     # For each fold
     for i, (train_idx, test_idx) in enumerate(kf.split(X_non_spatial), 1):
@@ -1221,26 +1219,32 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, X_rnd=None, bo
         # Get spatial features for this fold
         X_train_spatial = X_spatial.iloc[train_idx]
         
-        # Get borough codes for training set if available
-        borough_codes_train = None
-        if borough_codes is not None:
-            borough_codes_train = borough_codes.iloc[train_idx]
+        # Get borough dummies for this fold if available
+        train_borough_dummies = None
+        test_borough_dummies = None
+        if borough_dummies is not None:
+            train_borough_dummies = borough_dummies.iloc[train_idx]
+            test_borough_dummies = borough_dummies.iloc[test_idx]
         
         # Select features using Lasso on non-spatial features
-        selected_features = select_features_with_lasso(X_train_non_spatial, y_train)
+        selected_features = select_features_with_lasso(X_train_non_spatial, y_train, train_borough_dummies)
         X_train_selected = X_train_non_spatial[selected_features]
         X_test_selected = X_test_non_spatial[selected_features]
         
-        # Combine selected non-spatial features with spatial features
+        # Combine selected features with spatial features and borough dummies
         X_train_combined = pd.concat([X_train_selected, X_train_spatial[['x', 'y']]], axis=1)
         X_test_combined = pd.concat([X_test_selected, X_spatial.iloc[test_idx][['x', 'y']]], axis=1)
+        
+        if train_borough_dummies is not None:
+            X_train_combined = pd.concat([X_train_combined, train_borough_dummies], axis=1)
+            X_test_combined = pd.concat([X_test_combined, test_borough_dummies], axis=1)
         
         # Create spatial weight matrix for training data
         W_train = create_spatial_weight_matrix(X_train_spatial)
         
-        # Run Negative Binomial model with random effects for borough
+        # Run Negative Binomial model (without random effects)
         fold_results = run_nb_model(X_train_combined, y_train, X_test_combined, y_test, 
-                                    pi_train, W_train, borough_codes_train)
+                                  pi_train, W_train)
         
         # Skip this fold if model failed
         if fold_results is None:
@@ -1407,7 +1411,7 @@ def main():
     cv_results = run_cross_validation(
         data['X_non_spatial'], data['X_spatial'], 
         data['y'], data['int_no'], data['pi'], 
-        data.get('X_rnd'), data.get('borough_codes'), k=5
+        data.get('borough_dummies'), k=5
     )
     
     # Create visualizations from cross-validation results
