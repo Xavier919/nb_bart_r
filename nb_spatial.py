@@ -855,18 +855,68 @@ def load_and_prepare_data():
     # Filter where pi != 0
     data = data[data['pi'] != 0]
     
+    # First correct borough names with encoding issues
+    borough_corrections = {
+        '?le-Bizard-Sainte-GeneviÞve': 'Île-Bizard-Sainte-Geneviève',
+        'C¶te-Saint-Luc': 'Côte-Saint-Luc',
+        'C¶te-des-Neiges-Notre-Dame-de-Graces': 'Côte-des-Neiges-Notre-Dame-de-Grâce',
+        'MontrÚal-Est': 'Montréal-Est',
+        'MontrÚal-Nord': 'Montréal-Nord',
+        'Pointe-aux-Trembles-RiviÞres-des-Prairies': 'Rivière-des-Prairies-Pointe-aux-Trembles',
+        'St-LÚonard': 'Saint-Léonard'
+    }
+    
+    # Then group boroughs into zones
+    borough_zones = {
+        # Zone ouest
+        'Kirkland': 'Zone ouest',
+        'Beaconsfield': 'Zone ouest',
+        'Île-Bizard-Sainte-Geneviève': 'Zone ouest',
+        'Pierrefonds-Roxboro': 'Zone ouest',
+        'Dollard-des-Ormeaux': 'Zone ouest',
+        'Dorval': 'Zone ouest',
+        
+        # Zone est
+        'Rivière-des-Prairies-Pointe-aux-Trembles': 'Zone est',
+        'Montréal-Est': 'Zone est',
+        'Anjou': 'Zone est',
+        
+        # Zone centre
+        'Outremont': 'Zone centre',
+        'Mont-Royal': 'Zone centre',
+        
+        # Zone sud
+        'Sud-Ouest': 'Zone sud',
+        'Côte-Saint-Luc': 'Zone sud',
+        'Verdun': 'Zone sud',
+        'Lasalle': 'Zone sud',
+        'Lachine': 'Zone sud',
+        
+        # Zone centre-sud
+        'Côte-des-Neiges-Notre-Dame-de-Grâce': 'Zone centre-sud',
+        'Hampstead': 'Zone centre-sud',
+        'Westmount': 'Zone centre-sud'
+    }
+    
+    # Apply corrections if borough column exists
+    if 'borough' in data.columns:
+        # First fix encoding issues
+        data['borough'] = data['borough'].replace(borough_corrections)
+        # Then group into zones
+        data['borough'] = data['borough'].replace(borough_zones)
+        
     # Include existing spatial columns
     spatial_cols = ['x', 'y']
     
     # Filter out boroughs with fewer than 10 observations
     if 'borough' in data.columns:
-        # Count observations per borough
+        # Count observations per zone
         borough_counts = data['borough'].value_counts()
-        # Get boroughs with at least 10 observations
+        # Get zones with at least 10 observations
         valid_boroughs = borough_counts[borough_counts >= 10].index.tolist()
-        # Filter data to keep only valid boroughs
+        # Filter data to keep only valid zones
         data = data[data['borough'].isin(valid_boroughs)]
-        print(f"Filtered data to {len(valid_boroughs)} boroughs with ≥10 observations")
+        print(f"Filtered data to {len(valid_boroughs)} zones with ≥10 observations")
         print(f"Remaining data points: {len(data)}")
         
         # Convert borough to categorical for later use as random effect
@@ -1035,7 +1085,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_co
     # Define model options - reduced settings for faster computation
     options = Options(
         model_name='fixed_random',
-        nChain=1, nBurn=200, nSample=200, nThin=2, 
+        nChain=1, nBurn=200, nSample=500, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
     )
