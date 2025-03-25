@@ -384,8 +384,15 @@ class NegativeBinomial:
             mu_mu0, mu_Si0Inv, nu, A,
             sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
             r_init, beta_init, mu_init, Sigma_init,
-            ranking_top_m_list):
+            ranking_top_m_list,
+            seed=None):
         """Markov chain for MCMC simulation for negative binomial model."""
+        
+        # Set unique seed for this chain
+        if seed is not None:
+            np.random.seed(seed)
+        else:
+            np.random.seed(options.seed + chainID)  # Alternative approach
         
         # Storage setup
         file_name = options.model_name + '_draws_chain' + str(chainID + 1) + '.hdf5'
@@ -723,25 +730,48 @@ class NegativeBinomial:
         # Set random seed
         np.random.seed(options.seed)
         
+        # Create unique seeds for each chain
+        chain_seeds = np.random.randint(0, 10000, options.nChain)
+        
         # Start timer
         tic = time.time()
         
-        # Run all Markov chains
-        Parallel(n_jobs=options.nChain)(
-            delayed(self._mcmc_chain)(
-                chainID, 
-                options, bart_options,
-                r0, b0, c0,
-                beta_mu0, beta_Si0Inv,
-                mu_mu0, mu_Si0Inv, nu, A,
-                sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
-                r_init, beta_init, mu_init, Sigma_init,
-                ranking_top_m_list
-                ) for chainID in np.arange(options.nChain))
+        # Run chains sequentially instead of in parallel when nChain > 1
+        if options.nChain > 1:
+            # Run each chain sequentially 
+            for c in range(options.nChain):
+                self._mcmc_chain(
+                    c, 
+                    options, 
+                    bart_options,
+                    r0, b0, c0,
+                    beta_mu0, beta_Si0Inv,
+                    mu_mu0, mu_Si0Inv, nu, A,
+                    sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
+                    r_init, beta_init, mu_init, Sigma_init,
+                    ranking_top_m_list,
+                    seed=chain_seeds[c]
+                )
+        else:
+            # Use Parallel for a single chain (mostly for compatibility)
+            Parallel(n_jobs=1)(
+                delayed(self._mcmc_chain)(
+                    c, 
+                    options, 
+                    bart_options,
+                    r0, b0, c0,
+                    beta_mu0, beta_Si0Inv,
+                    mu_mu0, mu_Si0Inv, nu, A,
+                    sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
+                    r_init, beta_init, mu_init, Sigma_init,
+                    ranking_top_m_list,
+                    seed=chain_seeds[c]
+                ) for c in range(options.nChain)
+            )
             
         # End timer
         toc = time.time() - tic
-                
+        
         # Calculate posterior summaries
         post_r = self._posterior_summary(
             options, 'r', 1, 1, True
@@ -1065,7 +1095,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     # Define model options - reduced settings for faster computation
     options = Options(
         model_name='fixed_random',
-        nChain=1, nBurn=200, nSample=500, nThin=2, 
+        nChain=1, nBurn=200, nSample=200, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
     )
