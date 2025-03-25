@@ -858,12 +858,21 @@ def load_and_prepare_data():
     # Include existing spatial columns
     spatial_cols = ['x', 'y']
     
-    # Include borough as categorical variable if available
-    borough_dummies = pd.DataFrame()
+    # Filter out boroughs with fewer than 10 observations
     if 'borough' in data.columns:
+        # Count observations per borough
+        borough_counts = data['borough'].value_counts()
+        # Get boroughs with at least 10 observations
+        valid_boroughs = borough_counts[borough_counts >= 10].index.tolist()
+        # Filter data to keep only valid boroughs
+        data = data[data['borough'].isin(valid_boroughs)]
+        print(f"Filtered data to {len(valid_boroughs)} boroughs with ≥10 observations")
+        print(f"Remaining data points: {len(data)}")
+        
+        # Convert borough to categorical for later use as random effect
         data['borough'] = data['borough'].astype('category')
-        # Create dummy variables for borough
-        borough_dummies = pd.get_dummies(data['borough'], prefix='borough')
+        # Create borough codes for random effects (0-indexed categorical codes)
+        data['borough_code'] = data['borough'].cat.codes
     else:
         print("Variable 'borough' not found in the data")
     
@@ -873,7 +882,7 @@ def load_and_prepare_data():
                     'commercial', 'number_of_', 'of_exclusi', 'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r',
                     'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
                     'parking', 'north_veh', 'north_ped', 'east_veh', 'east_ped', 'south_veh', 'south_ped', 'west_veh', 'west_ped']
-        
+    
     # Check which columns actually exist in the data
     feature_cols = [col for col in feature_cols if col in data.columns]
     spatial_cols = [col for col in spatial_cols if col in data.columns]
@@ -887,11 +896,18 @@ def load_and_prepare_data():
         if col in X_base.columns:
             X_base[f'{col}_squared'] = X_base[col] ** 2
 
-    # Add borough dummy variables if available
-    if not borough_dummies.empty:
-        X_features = pd.concat([X_base, X_spatial, borough_dummies], axis=1)
-    else:
-        X_features = pd.concat([X_base, X_spatial], axis=1)
+    # Prepare random effects structure for borough
+    # Create a design matrix for random effects with a single borough indicator (1.0)
+    X_rnd = None
+    if 'borough' in data.columns:
+        # One-hot encoding for random effects
+        # We need a single column with 1.0 for each observation
+        X_rnd = np.ones((len(data), 1))
+        # Also store the borough codes for later use
+        X_spatial['borough_code'] = data['borough_code']
+    
+    # Combine all features for fixed effects (without borough dummies)
+    X_features = pd.concat([X_base, X_spatial], axis=1)
     
     return {
         'X': X_features, 
@@ -899,7 +915,9 @@ def load_and_prepare_data():
         'X_spatial': X_spatial,
         'y': data['acc'], 
         'int_no': data['int_no'],
-        'pi': data['pi']
+        'pi': data['pi'],
+        'X_rnd': X_rnd,
+        'borough_codes': data['borough_code'] if 'borough' in data.columns else None
     }
 
 
@@ -992,23 +1010,31 @@ def select_features_with_lasso(X, y):
     return selected_features
 
 
-def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
+def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train, borough_codes_train=None):
     """
-    Run Negative Binomial model with fixed parameters and spatial correlation
+    Run Negative Binomial model with fixed parameters, random effects for borough, and spatial correlation
     """
     # Convert to numpy arrays
     X_train_np = X_train.values.astype(np.float64)
     y_train_np = y_train.values.astype(np.int64)
     
+    # Setup random effects for borough if available
+    X_rnd_train = None
+    n_rnd = 0
+    if borough_codes_train is not None:
+        # Create a design matrix for random effects (1.0 for each observation)
+        X_rnd_train = np.ones((len(y_train), 1), dtype=np.float64)
+        n_rnd = 1  # One random effect (for borough)
+    
     # Create Data object for NegativeBinomial model
-    nb_data = Data(y=y_train_np, x_fix=X_train_np, x_rnd=None, W=W_train)
+    nb_data = Data(y=y_train_np, x_fix=X_train_np, x_rnd=X_rnd_train, W=W_train)
     
     # Initialize model
     nb_model = NegativeBinomial(nb_data, data_bart=None)
     
     # Define model options - reduced settings for faster computation
     options = Options(
-        model_name='fixed',
+        model_name='fixed_random',
         nChain=1, nBurn=200, nSample=200, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
@@ -1022,11 +1048,11 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     beta_mu0 = np.zeros(n_fix)
     beta_Si0Inv = 1e-2 * np.eye(n_fix)
     
-    # Initialize with zeros since we don't have random effects
-    mu_mu0 = np.zeros(0)
-    mu_Si0Inv = np.eye(0)
-    nu = 2
-    A = np.array([])
+    # Random effects parameters (for borough)
+    mu_mu0 = np.zeros(n_rnd)
+    mu_Si0Inv = 1e-2 * np.eye(n_rnd) if n_rnd > 0 else np.eye(0)
+    nu = 3  # Degrees of freedom for inverse-Wishart
+    A = np.ones(n_rnd) if n_rnd > 0 else np.array([])
     
     # Spatial parameters
     sigma2_b0 = 1e-2
@@ -1037,8 +1063,8 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     # Initialize parameters
     r_init = 5.0
     beta_init = np.zeros(n_fix)
-    mu_init = np.zeros(0)
-    Sigma_init = np.eye(0)
+    mu_init = np.zeros(n_rnd)
+    Sigma_init = np.eye(n_rnd) if n_rnd > 0 else np.eye(0)
     
     # Define ranking thresholds
     ranking_top_m_list = [10, 25, 50, 100]
@@ -1064,13 +1090,24 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
             print("Warning: NaN values detected in beta coefficients. Using zeros instead.")
             beta_mean = np.zeros_like(beta_mean)
         
+        # Get random effects mean if available
+        mu_mean = None
+        if hasattr(results, 'post_mu') and results.post_mu is not None:
+            mu_mean = results.post_mu['mean'].values[0] if results.post_mu.shape[0] > 0 else 0
+            
         # For negative binomial, calculate lambda = exp(X*beta) * r
         r_mean = results.post_r['mean'].values[0]
         if np.isnan(r_mean):
             print("Warning: NaN value detected in r parameter. Using 1.0 instead.")
             r_mean = 1.0
             
+        # Fixed effects contribution
         psi_test = X_test_np @ beta_mean
+        
+        # Random effects contribution (if available)
+        # For test set predictions, we use the mean random effect across all boroughs
+        if mu_mean is not None:
+            psi_test += mu_mean
         
         # Apply clipping to prevent overflow
         psi_test = np.clip(psi_test, -25, 25)
@@ -1092,7 +1129,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     return results
 
 
-def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
+def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, X_rnd=None, borough_codes=None, k=5):
     """
     Run k-fold cross-validation with the Negative Binomial model
     """
@@ -1116,6 +1153,8 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
     print(f"y shape: {y.shape}")
     print(f"int_no shape: {int_no.shape}")
     print(f"pi shape: {pi.shape}")
+    if borough_codes is not None:
+        print(f"borough_codes shape: {borough_codes.shape}")
     
     # For each fold
     for i, (train_idx, test_idx) in enumerate(kf.split(X_non_spatial), 1):
@@ -1132,6 +1171,11 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
         # Get spatial features for this fold
         X_train_spatial = X_spatial.iloc[train_idx]
         
+        # Get borough codes for training set if available
+        borough_codes_train = None
+        if borough_codes is not None:
+            borough_codes_train = borough_codes.iloc[train_idx]
+        
         # Select features using Lasso on non-spatial features
         selected_features = select_features_with_lasso(X_train_non_spatial, y_train)
         X_train_selected = X_train_non_spatial[selected_features]
@@ -1144,8 +1188,9 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
         # Create spatial weight matrix for training data
         W_train = create_spatial_weight_matrix(X_train_spatial)
         
-        # Run Negative Binomial model
-        fold_results = run_nb_model(X_train_combined, y_train, X_test_combined, y_test, pi_train, W_train)
+        # Run Negative Binomial model with random effects for borough
+        fold_results = run_nb_model(X_train_combined, y_train, X_test_combined, y_test, 
+                                    pi_train, W_train, borough_codes_train)
         
         # Skip this fold if model failed
         if fold_results is None:
@@ -1311,7 +1356,8 @@ def main():
     print("\nRunning cross-validation with Negative Binomial model...")
     cv_results = run_cross_validation(
         data['X_non_spatial'], data['X_spatial'], 
-        data['y'], data['int_no'], data['pi'], k=5
+        data['y'], data['int_no'], data['pi'], 
+        data.get('X_rnd'), data.get('borough_codes'), k=5
     )
     
     # Create visualizations from cross-validation results
