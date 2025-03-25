@@ -908,24 +908,6 @@ def load_and_prepare_data():
     # Include existing spatial columns
     spatial_cols = ['x', 'y']
     
-    # Filter out boroughs with fewer than 10 observations
-    if 'borough' in data.columns:
-        # Count observations per zone
-        borough_counts = data['borough'].value_counts()
-        # Get zones with at least 10 observations
-        valid_boroughs = borough_counts[borough_counts >= 10].index.tolist()
-        # Filter data to keep only valid zones
-        data = data[data['borough'].isin(valid_boroughs)]
-        print(f"Filtered data to {len(valid_boroughs)} zones with ≥10 observations")
-        print(f"Remaining data points: {len(data)}")
-        
-        # Convert borough to categorical for later use as random effect
-        data['borough'] = data['borough'].astype('category')
-        # Create borough codes for random effects (0-indexed categorical codes)
-        data['borough_code'] = data['borough'].cat.codes
-    else:
-        print("Variable 'borough' not found in the data")
-    
     # Base features (non-spatial)
     feature_cols = ['ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'traffic_10000', 'ln_cti', 'ln_cli', 'ln_cri',"ln_distdt",
                     'total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
