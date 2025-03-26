@@ -1018,9 +1018,9 @@ def create_spatial_weight_matrix(X_spatial):
         W = torch.zeros((n, n), device='cuda')
         
         # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 3000)] = 1.0       # Full weight within 3km (10% of extent)
-        W[(distances > 3000) & (distances <= 6000)] = 0.5    # Half weight within 3-6km
-        W[(distances > 6000) & (distances <= 9000)] = 0.25   # Quarter weight within 6-9km
+        W[(distances > 0) & (distances <= 750)] = 1.0        # Full weight within 0.75km
+        W[(distances > 750) & (distances <= 1500)] = 0.5     # Half weight within 0.75-1.5km
+        W[(distances > 1500) & (distances <= 2250)] = 0.25   # Quarter weight within 1.5-2.25km
         
         # Row-normalize the weight matrix
         row_sums = W.sum(dim=1, keepdim=True)
@@ -1035,9 +1035,9 @@ def create_spatial_weight_matrix(X_spatial):
         n = len(X_spatial)
         W = np.zeros((n, n))
         # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 3000)] = 1.0       # Full weight within 3km (10% of extent)
-        W[(distances > 3000) & (distances <= 6000)] = 0.5    # Half weight within 3-6km
-        W[(distances > 6000) & (distances <= 9000)] = 0.25   # Quarter weight within 6-9km
+        W[(distances > 0) & (distances <= 500)] = 1.0        # Full weight within 0.75km
+        W[(distances > 500) & (distances <= 1000)] = 0.5     # Half weight within 0.75-1.5km
+        W[(distances > 1000) & (distances <= 1500)] = 0.25   # Quarter weight within 1.5-2.25km
         
         row_sums = W.sum(axis=1)
         W[row_sums > 0] = W[row_sums > 0] / row_sums[row_sums > 0].reshape(-1, 1)
@@ -1866,7 +1866,7 @@ def main():
             full_model_results,
             W,
             "results",
-            correlation_threshold=0.5  # Slightly lower threshold for better visualization
+            correlation_threshold=0.3  # Slightly lower threshold for better visualization
         )
     
     # Run cross-validation for predictive performance evaluation
