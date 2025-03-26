@@ -965,7 +965,8 @@ def load_and_prepare_data():
     # Create dummy variables for borough if it exists
     borough_dummies = None
     if 'borough' in data.columns:
-        borough_dummies = pd.get_dummies(data['borough'], prefix='borough')
+        # Create dummies but drop the first category to avoid the dummy variable trap
+        borough_dummies = pd.get_dummies(data['borough'], prefix='borough', drop_first=True)
         # Add borough dummies to X_features
         X_features = pd.concat([X_base, X_spatial, borough_dummies], axis=1)
     else:
@@ -1097,7 +1098,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     # Define model options - reduced settings for faster computation
     options = Options(
         model_name='fixed_random',
-        nChain=1, nBurn=200, nSample=200, nThin=2, 
+        nChain=2, nBurn=1000, nSample=1000, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
     )
