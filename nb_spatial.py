@@ -20,6 +20,7 @@ import torch
 import torch.optim as optim
 from numba import jit
 import pypolyagamma as pypolyagamma
+import networkx as nx
 
 #####################################
 # Data and Utility Classes
@@ -1015,9 +1016,9 @@ def create_spatial_weight_matrix(X_spatial):
         W = torch.zeros((n, n), device='cuda')
         
         # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 200)] = 1.0
-        W[(distances > 200) & (distances <= 400)] = 0.5
-        W[(distances > 400) & (distances <= 600)] = 0.25
+        W[(distances > 0) & (distances <= 250)] = 1.0
+        W[(distances > 250) & (distances <= 500)] = 0.5
+        W[(distances > 500) & (distances <= 1000)] = 0.25
         
         # Row-normalize the weight matrix
         row_sums = W.sum(dim=1, keepdim=True)
@@ -1031,9 +1032,10 @@ def create_spatial_weight_matrix(X_spatial):
         distances = squareform(pdist(coords, 'euclidean'))
         n = len(X_spatial)
         W = np.zeros((n, n))
-        W[(distances > 0) & (distances <= 200)] = 1.0
-        W[(distances > 200) & (distances <= 400)] = 0.5
-        W[(distances > 400) & (distances <= 600)] = 0.25
+        # Define weights based on adjacency orders
+        W[(distances > 0) & (distances <= 250)] = 1.0
+        W[(distances > 250) & (distances <= 500)] = 0.5
+        W[(distances > 500) & (distances <= 1000)] = 0.25
         
         row_sums = W.sum(axis=1)
         W[row_sums > 0] = W[row_sums > 0] / row_sums[row_sums > 0].reshape(-1, 1)
@@ -1244,8 +1246,8 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummie
         X_test_selected = X_test_non_spatial[selected_features]
         
         # Combine selected features with spatial features and borough dummies
-        X_train_combined = pd.concat([X_train_selected, X_train_spatial[['x', 'y']]], axis=1)
-        X_test_combined = pd.concat([X_test_selected, X_spatial.iloc[test_idx][['x', 'y']]], axis=1)
+        X_train_combined = X_train_selected.copy()
+        X_test_combined = X_test_selected.copy()
         
         if train_borough_dummies is not None:
             X_train_combined = pd.concat([X_train_combined, train_borough_dummies], axis=1)
@@ -1338,6 +1340,34 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummie
     combined_rankings['ranking'] = range(1, len(combined_rankings) + 1)
     combined_rankings.to_csv(os.path.join(results_path, "nb_model_combined_intersections_cv_ranking.csv"), index=False)
     
+    # ADDED: Generate spatial correlation plot using the last fold's model results
+    # Since we want a single spatial correlation plot after all CV folds are complete
+    if results_list and len(results_list) > 0:
+        last_model = results_list[-1]  # Use the last model from cross-validation
+        
+        # Create a spatial DataFrame with the results
+        spatial_df = pd.DataFrame({
+            'int_no': int_no,
+            'x': X_spatial['x'],
+            'y': X_spatial['y'],
+            'pred_counts': combined_results['pred_counts']
+        })
+        
+        # Create the last fold's W matrix
+        last_fold_idx = list(kf.split(X_non_spatial))[-1][0]  # Get train indices from last fold
+        last_fold_spatial = X_spatial.iloc[last_fold_idx]
+        W_last = create_spatial_weight_matrix(last_fold_spatial)
+        
+        # Generate the spatial correlation network plot
+        print("\nGenerating spatial correlation network from cross-validation results...")
+        plot_spatial_correlation_network(
+            spatial_df,
+            last_model,
+            W_last,
+            results_path,
+            correlation_threshold=0.2  # Slightly lower threshold for better visualization
+        )
+    
     return {
         'results_per_fold': results_list,
         'metrics_per_fold': all_metrics,
@@ -1346,67 +1376,200 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummie
     }
 
 
-def plot_results(combined_results, X_spatial, int_no=None):
-    """Plot visualizations of the model results"""
-    results_path = "results"
+def plot_spatial_correlation_network(spatial_results, results, W, results_path, correlation_threshold=0.3):
+    """
+    Create a network visualization showing the estimated spatial correlation between intersections
+    based on the model's tau and sigma_mess parameters.
+    
+    Args:
+        spatial_results: DataFrame containing int_no, x, y, and pred_counts
+        results: Results object from the Negative Binomial model
+        W: The spatial weight matrix used in modeling
+        results_path: Path to save the visualization
+        correlation_threshold: Minimum correlation to display a connection
+    """
+    try:
+        import networkx as nx
+        from scipy.linalg import expm
+        print("Creating estimated spatial correlation network visualization...")
+        
+        # Check if spatial parameters are available
+        if results.post_tau is None or results.post_sigma_mess is None:
+            print("Cannot create correlation network: spatial parameters not available in model results")
+            return
+            
+        # Extract spatial parameters
+        tau = results.post_tau['mean'].values[0]
+        sigma_mess = results.post_sigma_mess['mean'].values[0]
+        print(f"Using estimated spatial parameters: tau={tau:.4f}, sigma_mess={sigma_mess:.4f}")
+        
+        # Calculate spatial correlation matrix
+        S = expm(tau * W)
+        sigma2 = sigma_mess**2
+        precision_matrix = S.T @ S / sigma2
+        
+        # Convert precision to covariance
+        try:
+            covariance_matrix = np.linalg.inv(precision_matrix)
+        except np.linalg.LinAlgError:
+            covariance_matrix = np.linalg.pinv(precision_matrix)
+        
+        # Convert to correlation matrix
+        diag_values = np.abs(np.diag(covariance_matrix))  # Use absolute values to avoid issues
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_values))
+        correlation_matrix = np.clip(D_sqrt_inv @ covariance_matrix @ D_sqrt_inv, -1, 1)
+        
+        # Create network graph
+        G = nx.Graph()
+        
+        # Get subset of intersections
+        int_indices = spatial_results.index.tolist()[:correlation_matrix.shape[0]]
+        
+        # Add nodes (intersections)
+        for i, row in spatial_results.iterrows():
+            if i < len(int_indices):
+                G.add_node(i, pos=(row['x'], row['y']), 
+                          accidents=row['pred_counts'],
+                          int_no=row['int_no'])
+        
+        # Add edges for correlated intersections
+        n = min(len(int_indices), correlation_matrix.shape[0])
+        edge_weights = []
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                corr = abs(correlation_matrix[i, j])
+                if corr > correlation_threshold:
+                    G.add_edge(i, j, weight=corr)
+                    edge_weights.append(corr)
+        
+        if not edge_weights:
+            print(f"No correlations above threshold {correlation_threshold}. Try lowering the threshold.")
+            return
+            
+        # Create visualization
+        fig, ax = plt.subplots(figsize=(15, 12))
+        pos = nx.get_node_attributes(G, 'pos')
+        
+        # Draw nodes (small and transparent)
+        nx.draw_networkx_nodes(G, pos, 
+                              node_size=10,
+                              node_color='lightgray',
+                              alpha=0.3,
+                              ax=ax)
+        
+        # Draw edges with color based on correlation strength
+        edge_weights_list = [G[u][v]['weight'] for u, v in G.edges()]
+        nx.draw_networkx_edges(G, pos, 
+                              width=2.0,
+                              alpha=0.7,
+                              edge_color=edge_weights_list, 
+                              edge_cmap=plt.cm.YlOrRd, 
+                              ax=ax)
+        
+        # Add colorbar
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.YlOrRd, 
+                                  norm=plt.Normalize(vmin=correlation_threshold, 
+                                                    vmax=max(edge_weights)))
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='Estimated Spatial Correlation (absolute value)')
+        
+        plt.title(f'Estimated Spatial Correlation Network (tau={tau:.3f}, sigma={sigma_mess:.3f})')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'estimated_correlation_network.png'), dpi=300)
+        
+        print("Estimated spatial correlation network visualization saved.")
+        
+    except ImportError:
+        print("NetworkX library not available. Install with 'pip install networkx' to enable network visualization.")
+    except Exception as e:
+        print(f"Error creating spatial correlation network: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def report_model_coefficients(results, X_columns, results_path="results"):
+    """
+    Create a clear, formatted table of model coefficients and save to CSV.
+    Also creates a coefficient plot with confidence intervals.
+    
+    Args:
+        results: Model results object containing posterior samples
+        X_columns: Column names for the design matrix
+        results_path: Path to save results
+    """
+    if not hasattr(results, 'post_beta') or results.post_beta is None:
+        print("No coefficient information available in model results")
+        return
+    
+    # Create coefficient table
+    coef_table = results.post_beta.copy()
+    coef_table.index = X_columns
+    
+    # Rename columns for clarity
+    coef_table = coef_table.rename(columns={
+        'mean': 'Estimate',
+        'std. dev.': 'Std. Error',
+        '2.5%': 'Lower 95% CI',
+        '97.5%': 'Upper 95% CI'
+    })
+    
+    # Add a column for significance
+    coef_table['Significant'] = ((coef_table['Lower 95% CI'] > 0) & 
+                                (coef_table['Upper 95% CI'] > 0)) | \
+                               ((coef_table['Lower 95% CI'] < 0) & 
+                                (coef_table['Upper 95% CI'] < 0))
+    
+    # Sort by absolute effect size
+    coef_table = coef_table.sort_values(by='Estimate', key=abs, ascending=False)
+    
+    # Print nicely formatted table to console
+    pd.set_option('display.max_rows', None)  # Show all rows
+    pd.set_option('display.width', 120)      # Wider display
+    pd.set_option('display.precision', 4)    # Show 4 decimal places
+    
+    print("\n=== Model Coefficients ===")
+    print(coef_table[['Estimate', 'Std. Error', 'Lower 95% CI', 'Upper 95% CI', 'Significant']])
+    
+    # Save to CSV
     os.makedirs(results_path, exist_ok=True)
+    coef_table.to_csv(os.path.join(results_path, "model_coefficients.csv"))
+    print(f"Coefficient table saved to {os.path.join(results_path, 'model_coefficients.csv')}")
     
-    # Create figure for predicted vs actual counts
-    plt.figure(figsize=(10, 6))
-    plt.scatter(combined_results['true_counts'], combined_results['pred_counts'], alpha=0.6)
-    plt.plot([0, max(combined_results['true_counts'])], [0, max(combined_results['true_counts'])], 'r--')
-    plt.xlabel('Observed Accident Counts')
-    plt.ylabel('Predicted Accident Counts')
-    plt.title('Observed vs Predicted Accident Counts')
-    plt.grid(True)
+    # Create coefficient plot
+    plt.figure(figsize=(12, max(8, len(coef_table) * 0.3)))
+    
+    # Plot coefficients and confidence intervals
+    y_pos = np.arange(len(coef_table))
+    
+    # Instead of using a list of colors in errorbar, plot each point separately
+    for i, (idx, row) in enumerate(coef_table.iterrows()):
+        color = 'darkred' if row['Significant'] else 'darkblue'
+        plt.errorbar(
+            x=row['Estimate'],
+            y=i,
+            xerr=[[row['Estimate'] - row['Lower 95% CI']], 
+                  [row['Upper 95% CI'] - row['Estimate']]],
+            fmt='o',
+            capsize=5,
+            color=color,
+            alpha=0.7
+        )
+    
+    # Add vertical line at zero
+    plt.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+    
+    # Add labels and title
+    plt.yticks(y_pos, coef_table.index)
+    plt.xlabel('Coefficient Estimate')
+    plt.title('Model Coefficients with 95% Confidence Intervals')
+    plt.grid(axis='x', alpha=0.3)
+    
+    # Adjust layout and save
     plt.tight_layout()
-    plt.savefig(os.path.join(results_path, 'predicted_vs_actual.png'))
-    
-    # Plot spatial distribution of accidents
-    if 'x' in X_spatial.columns and 'y' in X_spatial.columns:
-        # Create a DataFrame with int_no, x, y by merging information
-        spatial_results = pd.DataFrame()
-        
-        # Group by int_no and calculate mean predicted counts
-        pred_by_int = combined_results.groupby('int_no')['pred_counts'].mean().reset_index()
-        
-        # Use provided int_no if not already in X_spatial
-        if 'int_no' not in X_spatial.columns and int_no is not None:
-            X_spatial_with_int = X_spatial.copy()
-            X_spatial_with_int['int_no'] = int_no.values
-        else:
-            X_spatial_with_int = X_spatial
-        
-        # Only proceed if we can match int_no with coordinates
-        if 'int_no' in X_spatial_with_int.columns:
-            spatial_mapping = X_spatial_with_int[['int_no', 'x', 'y']].drop_duplicates('int_no').set_index('int_no')
-            
-            # Merge spatial coordinates with predictions
-            spatial_results = pd.merge(
-                pred_by_int, 
-                spatial_mapping.reset_index(), 
-                on='int_no', how='inner'
-            )
-            
-            # Create spatial plot if we have data
-            if not spatial_results.empty:
-                plt.figure(figsize=(12, 10))
-                plt.scatter(spatial_results['x'], spatial_results['y'], 
-                           c=spatial_results['pred_counts'], cmap='viridis', 
-                           s=50, alpha=0.8)
-                plt.colorbar(label='Predicted Accident Count')
-                plt.xlabel('X Coordinate')
-                plt.ylabel('Y Coordinate')
-                plt.title('Spatial Distribution of Predicted Accident Counts')
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(os.path.join(results_path, 'spatial_distribution.png'))
-            else:
-                print("Skipping spatial plot: Could not match int_no with spatial coordinates")
-        else:
-            print("Warning: Cannot create spatial plot - unable to match int_no with coordinates")
-    
-    print("Plots saved as PNG files in the results directory.")
+    plt.savefig(os.path.join(results_path, "coefficient_plot.png"), dpi=300)
+    print(f"Coefficient plot saved to {os.path.join(results_path, 'coefficient_plot.png')}")
 
 
 def main():
@@ -1418,22 +1581,65 @@ def main():
     print("Loading and preparing data...")
     data = load_and_prepare_data()
     
-    # Run 5-fold cross validation with NegativeBinomial model
-    print("\nRunning cross-validation with Negative Binomial model...")
+    # First fit the full model to the entire dataset
+    print("\n========== Full Model on Entire Dataset ==========")
+    
+    # Select features using Lasso on non-spatial features
+    selected_features = select_features_with_lasso(data['X_non_spatial'], data['y'], data.get('borough_dummies'))
+    X_selected = data['X_non_spatial'][selected_features]
+    
+    # Combine selected features with spatial features and borough dummies
+    X_combined = X_selected.copy()
+    
+    if data.get('borough_dummies') is not None:
+        X_combined = pd.concat([X_combined, data.get('borough_dummies')], axis=1)
+    
+    # Create spatial weight matrix
+    W = create_spatial_weight_matrix(data['X_spatial'])
+    
+    # Run Negative Binomial model on full dataset
+    full_model_results = run_nb_model(X_combined, data['y'], X_combined, data['y'], 
+                                    data['pi'], W)
+    
+    # Report model information criteria
+    if full_model_results is not None:
+        print("\n=== Full Model Results ===")
+        if hasattr(full_model_results, 'lppd'):
+            print(f"LPPD: {full_model_results.lppd:.2f}")
+        if hasattr(full_model_results, 'waic'):
+            print(f"WAIC: {full_model_results.waic:.2f}")
+        
+        # Report coefficients in a clear, formatted table
+        report_model_coefficients(full_model_results, X_combined.columns)
+        
+        # Report spatial parameters
+        if hasattr(full_model_results, 'post_sigma_mess') and full_model_results.post_sigma_mess is not None:
+            print("\nSpatial Parameters:")
+            print(f"sigma_mess (mean): {full_model_results.post_sigma_mess['mean'].values[0]:.4f}")
+        if hasattr(full_model_results, 'post_tau') and full_model_results.post_tau is not None:
+            print(f"tau (mean): {full_model_results.post_tau['mean'].values[0]:.4f}")
+        
+        # Report negative binomial dispersion parameter
+        if hasattr(full_model_results, 'post_r') and full_model_results.post_r is not None:
+            print(f"\nNegative Binomial Dispersion Parameter (r):")
+            print(f"r (mean): {full_model_results.post_r['mean'].values[0]:.4f}")
+    
+    # Run cross-validation for predictive performance evaluation
+    print("\nRunning cross-validation to evaluate predictive performance...")
     cv_results = run_cross_validation(
-        data['X_non_spatial'], data['X_spatial'], 
-        data['y'], data['int_no'], data['pi'], 
-        data.get('borough_dummies'), k=5
+        data['X_non_spatial'], 
+        data['X_spatial'], 
+        data['y'], 
+        data['int_no'], 
+        data['pi'], 
+        data.get('borough_dummies'), 
+        k=5
     )
     
-    # Create visualizations from cross-validation results
-    print("\nCreating visualization plots...")
-    plot_results(cv_results['combined_results'], data['X_spatial'], data['int_no'])
-    
     print("\nProcessing complete. Results saved to 'results' directory.")
-    return cv_results
+    return full_model_results, cv_results
 
 
 # Run the main script
 if __name__ == "__main__":
-    results = main()
+    full_results, cv_results = main()
