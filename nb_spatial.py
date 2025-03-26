@@ -940,7 +940,7 @@ def load_and_prepare_data():
     spatial_cols = ['x', 'y']
     
     # Base features (non-spatial)
-    feature_cols = ['ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'traffic_10000', 'ln_cti', 'ln_cli', 'ln_cri',"ln_distdt",
+    feature_cols = ['ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'ln_cti', 'ln_cli', 'ln_cri',"ln_distdt",
                     'total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
                     'commercial', 'number_of_', 'of_exclusi', 'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r',
                     'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
@@ -1053,7 +1053,6 @@ def select_features_with_lasso(X, y, borough_dummies=None):
     important_features = ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi', 
                          'ln_cti_squared', 'ln_cri_squared', 'ln_cli_squared', 'ln_pi_squared', 
                          'ln_fri_squared', 'ln_fli_squared', 'ln_fi_squared']
-    
     # Add borough dummy columns to important features if they exist
     if borough_dummies is not None:
         important_features.extend(borough_dummies.columns.tolist())
@@ -1341,34 +1340,6 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummie
     combined_rankings['ranking'] = range(1, len(combined_rankings) + 1)
     combined_rankings.to_csv(os.path.join(results_path, "nb_model_combined_intersections_cv_ranking.csv"), index=False)
     
-    # ADDED: Generate spatial correlation plot using the last fold's model results
-    # Since we want a single spatial correlation plot after all CV folds are complete
-    if results_list and len(results_list) > 0:
-        last_model = results_list[-1]  # Use the last model from cross-validation
-        
-        # Create a spatial DataFrame with the results
-        spatial_df = pd.DataFrame({
-            'int_no': int_no,
-            'x': X_spatial['x'],
-            'y': X_spatial['y'],
-            'pred_counts': combined_results['pred_counts']
-        })
-        
-        # Create the last fold's W matrix
-        last_fold_idx = list(kf.split(X_non_spatial))[-1][0]  # Get train indices from last fold
-        last_fold_spatial = X_spatial.iloc[last_fold_idx]
-        W_last = create_spatial_weight_matrix(last_fold_spatial)
-        
-        # Generate the spatial correlation network plot
-        print("\nGenerating spatial correlation network from cross-validation results...")
-        plot_spatial_correlation_network(
-            spatial_df,
-            last_model,
-            W_last,
-            results_path,
-            correlation_threshold=0.2  # Slightly lower threshold for better visualization
-        )
-    
     return {
         'results_per_fold': results_list,
         'metrics_per_fold': all_metrics,
@@ -1377,7 +1348,7 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummie
     }
 
 
-def plot_spatial_correlation_network(spatial_results, results, W, results_path, correlation_threshold=0.3):
+def plot_spatial_correlation_network(spatial_results, results, W, results_path, correlation_threshold=0.5):
     """
     Create a network visualization showing the estimated spatial correlation between intersections
     based on the model's tau and sigma_mess parameters.
@@ -1446,8 +1417,9 @@ def plot_spatial_correlation_network(spatial_results, results, W, results_path, 
                 
                 # Store all correlations with intersection IDs
                 if i < len(int_indices) and j < len(int_indices):
-                    int_i = spatial_results.iloc[i]['int_no'] if i < len(spatial_results) else f"idx_{i}"
-                    int_j = spatial_results.iloc[j]['int_no'] if j < len(spatial_results) else f"idx_{j}"
+                    # FIX: Make sure we're accessing the correct indices in spatial_results
+                    int_i = spatial_results.iloc[int_indices[i]]['int_no'] if i < len(int_indices) else f"idx_{i}"
+                    int_j = spatial_results.iloc[int_indices[j]]['int_no'] if j < len(int_indices) else f"idx_{j}"
                     all_correlations.append((int_i, int_j, corr))
                 
                 if corr > correlation_threshold:
@@ -1810,6 +1782,24 @@ def main():
         if hasattr(full_model_results, 'post_r') and full_model_results.post_r is not None:
             print(f"\nNegative Binomial Dispersion Parameter (r):")
             print(f"r (mean): {full_model_results.post_r['mean'].values[0]:.4f}")
+        
+        # FIXED: Generate spatial correlation network from full model results
+        # Ensure all arrays are 1-dimensional
+        spatial_df = pd.DataFrame({
+            'int_no': data['int_no'].values.flatten(),
+            'x': data['X_spatial']['x'].values.flatten(),
+            'y': data['X_spatial']['y'].values.flatten(),
+            'pred_counts': full_model_results.post_mean_lam.flatten()
+        })
+        
+        print("\nGenerating spatial correlation network from full model results...")
+        plot_spatial_correlation_network(
+            spatial_df,
+            full_model_results,
+            W,
+            "results",
+            correlation_threshold=0.5  # Slightly lower threshold for better visualization
+        )
     
     # Run cross-validation for predictive performance evaluation
     print("\nRunning cross-validation to evaluate predictive performance...")
@@ -1826,13 +1816,16 @@ def main():
     # Create visualizations from cross-validation results
     if cv_results and 'combined_results' in cv_results:
         
-        # Create spatial visualization of CV predictions
+        # FIXED: Create spatial visualization of CV predictions
+        # Group by int_no and calculate mean predictions
+        cv_pred_by_int = cv_results['combined_results'].groupby('int_no')['pred_counts'].mean()
+        
         cv_spatial_df = pd.DataFrame({
-            'int_no': data['int_no'],
-            'x': data['X_spatial']['x'],
-            'y': data['X_spatial']['y'],
-            'pred_counts': cv_results['combined_results'].groupby('int_no')['pred_counts'].mean(),
-            'actual_counts': data['y']
+            'int_no': data['int_no'].values.flatten(),
+            'x': data['X_spatial']['x'].values.flatten(),
+            'y': data['X_spatial']['y'].values.flatten(),
+            'pred_counts': [cv_pred_by_int.get(int_id, np.nan) for int_id in data['int_no'].values.flatten()],
+            'actual_counts': data['y'].values.flatten()
         })
         
         # Generate heatmap from cross-validation results
