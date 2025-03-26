@@ -1437,12 +1437,41 @@ def plot_spatial_correlation_network(spatial_results, results, W, results_path, 
         n = min(len(int_indices), correlation_matrix.shape[0])
         edge_weights = []
         
+        # Store all correlations for finding top pairs
+        all_correlations = []
+        
         for i in range(n):
             for j in range(i+1, n):
                 corr = abs(correlation_matrix[i, j])
+                
+                # Store all correlations with intersection IDs
+                if i < len(int_indices) and j < len(int_indices):
+                    int_i = spatial_results.iloc[i]['int_no'] if i < len(spatial_results) else f"idx_{i}"
+                    int_j = spatial_results.iloc[j]['int_no'] if j < len(spatial_results) else f"idx_{j}"
+                    all_correlations.append((int_i, int_j, corr))
+                
                 if corr > correlation_threshold:
                     G.add_edge(i, j, weight=corr)
                     edge_weights.append(corr)
+        
+        # Save top 30 most correlated intersection pairs
+        if all_correlations:
+            # Sort by correlation strength (descending)
+            all_correlations.sort(key=lambda x: x[2], reverse=True)
+            
+            # Take top 30 (or fewer if there aren't 30)
+            top_30 = all_correlations[:30]
+            
+            # Create DataFrame and save to CSV
+            top_corr_df = pd.DataFrame(top_30, columns=['Intersection_1', 'Intersection_2', 'Correlation'])
+            top_corr_path = os.path.join(results_path, 'top_30_correlated_intersections.csv')
+            top_corr_df.to_csv(top_corr_path, index=False)
+            print(f"Top 30 correlated intersection pairs saved to {top_corr_path}")
+            
+            # Also print the top 10 to console
+            print("\nTop 10 most correlated intersection pairs:")
+            for i, (int1, int2, corr) in enumerate(top_30[:10], 1):
+                print(f"{i}. Intersections {int1} and {int2}: correlation = {corr:.4f}")
         
         if not edge_weights:
             print(f"No correlations above threshold {correlation_threshold}. Try lowering the threshold.")
@@ -1615,25 +1644,6 @@ def plot_accident_heatmap(spatial_results, results_path="results"):
         plt.tight_layout()
         plt.savefig(os.path.join(results_path, 'accident_prediction_heatmap.png'), dpi=300)
         print(f"Accident prediction heatmap saved to {os.path.join(results_path, 'accident_prediction_heatmap.png')}")
-        
-        # Create a second visualization with hexbin for density
-        plt.figure(figsize=(14, 12))
-        hexbin = plt.hexbin(
-            spatial_results['x'], 
-            spatial_results['y'],
-            C=spatial_results['pred_counts'],
-            gridsize=50,
-            cmap='YlOrRd',
-            mincnt=1
-        )
-        plt.colorbar(hexbin, label='Mean Predicted Accidents')
-        plt.title('Density Heatmap of Predicted Accidents')
-        plt.xlabel('X Coordinate')
-        plt.ylabel('Y Coordinate')
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(os.path.join(results_path, 'accident_prediction_density.png'), dpi=300)
-        print(f"Accident prediction density map saved to {os.path.join(results_path, 'accident_prediction_density.png')}")
         
     except Exception as e:
         print(f"Error creating accident heatmap: {e}")
@@ -1826,7 +1836,7 @@ def main():
         })
         
         # Generate heatmap from cross-validation results
-        plot_accident_heatmap(cv_spatial_df, results_path="results/cv_results")
+        plot_accident_heatmap(cv_spatial_df, results_path="results")
         
         # Generate predicted vs actual plots from cross-validation results
         plot_predicted_vs_actual(
