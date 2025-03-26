@@ -1,6 +1,10 @@
 import pandas as pd
 import numpy as np
 import os
+import sys
+import time
+from joblib import Parallel, delayed
+import h5py
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.linear_model import LassoCV
@@ -9,15 +13,873 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.linalg import expm
+from scipy.special import loggamma
+from scipy.stats import invwishart, rankdata
 import torch
 import torch.optim as optim
+from numba import jit
+import pypolyagamma as pypolyagamma
+import networkx as nx
+from sklearn.linear_model import PoissonRegressor
+from sklearn.neighbors import NearestNeighbors
 
-# Import classes from negative_binomial.py
-from negative_binomial import NegativeBinomial, Data, Options, Results
+#####################################
+# Data and Utility Classes
+#####################################
 
+class Data:
+    """Holds the training data for Negative Binomial modeling.
+    
+    Attributes:
+        y (array): dependent count data.
+        N (int): number of dependent data.
+        x_fix (array): covariates for fixed link function parameters.
+        n_fix (int): number of covariates for fixed link function parameters.
+        x_rnd (array): covariates for random link function parameters.
+        n_rnd (int): number of covariates for random link function parameters.
+        W (array): row-normalized spatial weight matrix.
+    """   
+    
+    def __init__(self, y, x_fix, x_rnd, W):
+        self.y = y
+        self.N = y.shape[0]
+        
+        self.x_fix = x_fix
+        if x_fix is not None:
+            self.n_fix = x_fix.shape[1]
+        else:
+            self.n_fix = 0
+            
+        self.x_rnd = x_rnd
+        if x_rnd is not None:
+            self.n_rnd = x_rnd.shape[1] 
+        else:
+            self.n_rnd = 0
+            
+        self.W = W
+        
+
+class Options:
+    """Contains options for MCMC algorithm.
+    
+    Attributes:
+        model_name (string): name of the model to be estimated.
+        nChain (int): number of Markov chains.
+        nBurn (int): number of samples for burn-in. 
+        nSample (int): number of samples after burn-in period.
+        nThin (int): thinning factors.
+        disp (int): number of samples after which progress is displayed. 
+        mh_step_initial (float): Initial MH step size.
+        mh_target (float): target MH acceptance rate.
+        mh_correct (float): correction of MH step.
+        mh_window (int): number of samples after which to adjust MG step size.
+        delete_draws (bool): Whether simulation draws should be deleted.
+        seed (int): random seed.
+    """   
+
+    def __init__(
+            self, 
+            model_name='test',
+            nChain=1, nBurn=500, nSample=500, nThin=2, nMem=None, disp=100, 
+            mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
+            delete_draws=True, seed=4711
+            ):
+        self.model_name = model_name
+        self.nChain = nChain
+        self.nBurn = nBurn
+        self.nSample = nSample
+        self.nIter = nBurn + nSample
+        self.nThin = nThin
+        self.nKeep = int(nSample / nThin)
+        if nMem is None:
+            self.nMem = self.nKeep
+        else:
+            self.nMem = nMem
+        self.disp = disp
+        
+        self.mh_step_initial = mh_step_initial
+        self.mh_target = mh_target
+        self.mh_correct = mh_correct
+        self.mh_window = mh_window
+        
+        self.delete_draws = delete_draws
+        self.seed = seed
+        
+        
+class Results:
+    """Holds simulation results.
+    
+    Attributes:
+        options (Options): Options used for MCMC algorithm.
+        estimation time (float): Estimation time.
+        lppd (float): Log pointwise predictive density.
+        waic (float): Widely applicable information criterion.
+        post_mean_lam (array): Posterior mean of expected count.
+        rmse, mae, rmsle (float): Error metrics.
+        post_mean_ranking (array): Posterior mean site rank.
+        post_mean_ranking_top (array): Posterior probability that a site
+          belongs to the top m most hazardous sites.
+        ranking_top_m_list (list): List of m values for top site calculations.
+        post_r (DataFrame): Posterior summary of negative binomial success rate.
+        post_beta (DataFrame): Posterior summary of fixed link function parameters.
+        post_mu (DataFrame): Posterior summary of random link function parameters.
+        post_sigma (DataFrame): Posterior summary of standard deviations.
+        post_Sigma (DataFrame): Posterior covariance matrix.
+        post_sigma_mess: Posterior summary of spatial error scale.
+        post_tau: Posterior summary of MESS association parameters.
+    """   
+    
+    def __init__(self, 
+                 options, bart_options, toc, 
+                 lppd, waic,
+                 post_mean_lam, 
+                 rmse, mae, rmsle,
+                 post_mean_ranking, 
+                 post_mean_ranking_top, ranking_top_m_list,
+                 post_r, post_mean_f, 
+                 post_beta,
+                 post_mu, post_sigma, post_Sigma,
+                 post_variable_inclusion_props,
+                 post_sigma_mess, post_tau):
+        self.options = options
+        self.bart_options = bart_options
+        self.estimation_time = toc
+        
+        self.lppd = lppd
+        self.waic = waic
+        self.post_mean_lam = post_mean_lam
+        self.rmse = rmse
+        self.mae = mae
+        self.rmsle = rmsle
+        
+        self.post_mean_ranking = post_mean_ranking
+        self.post_mean_ranking_top = post_mean_ranking_top
+        self.ranking_top_m_list = ranking_top_m_list
+        
+        self.post_r = post_r
+        self.post_mean_f = post_mean_f
+        
+        self.post_variable_inclusion_props = post_variable_inclusion_props
+        
+        self.post_beta = post_beta
+        
+        self.post_mu = post_mu
+        self.post_sigma = post_sigma
+        self.post_Sigma = post_Sigma
+        
+        self.post_sigma_mess = post_sigma_mess
+        self.post_tau = post_tau
+        
+        # Add test predictions attribute for cross-validation
+        self.test_predictions = None
+        self.test_actual = None
+
+
+#####################################
+# NegativeBinomial Model Class
+#####################################
+
+class NegativeBinomial:
+    """MCMC method for posterior inference in negative binomial model."""
+    
+    @staticmethod
+    def _F_matrix(y):
+        """Calculates F matrix."""
+        y_max = np.max(y)
+        F = np.zeros((y_max, y_max))
+        for m in np.arange(y_max):
+            for j in np.arange(m+1):
+                if m==0 and j==0:
+                    F[m,j] = 1
+                else:
+                    F[m,j] = m/(m+1) * F[m-1,j] + (1/(m+1)) * F[m-1,j-1]
+        return F
+    
+    def __init__(self, data, data_bart=None):
+        self.data = data
+        self.data_bart = data_bart
+        self.F = self._F_matrix(data.y)
+        self.N = data.N
+        self.n_fix = data.n_fix
+        self.n_rnd = data.n_rnd
+        self.mess = data.W is not None
+
+    # Convenience methods
+    @staticmethod
+    def _pg_rnd(a, b):
+        """Takes draws from Polya-Gamma distribution with parameters a, b."""
+        ppg = pypolyagamma.PyPolyaGamma(np.random.randint(2**16))
+        N = a.shape[0]
+        r = np.zeros((N,))
+        ppg.pgdrawv(a, b, r)
+        return r
+    
+    @staticmethod
+    def _mvn_prec_rnd(mu, P):
+        """Takes draws from multivariate normal with mean mu and precision P."""
+        d = mu.shape[0]
+        P_chT = np.linalg.cholesky(P).T
+        r = mu + np.linalg.solve(P_chT, np.random.randn(d,1)).reshape(d,)
+        return r 
+    
+    @staticmethod
+    def _mvn_prec_rnd_arr(mu, P):
+        """Takes draws from multivariate normal with array of mean vectors."""
+        N, d = mu.shape
+        P_chT = np.moveaxis(np.linalg.cholesky(P), [1,2], [2,1])
+        r = mu + np.linalg.solve(P_chT, np.random.randn(N,d,1)).reshape(N,d)
+        return r 
+    
+    @staticmethod
+    def _nb_lpmf(y, psi, r):
+        """Calculates log pmf of negative binomial."""
+        lc = loggamma(y + r) - loggamma(r) - loggamma(y + 1)
+        lp = y * psi - (y + r) * np.log1p(np.exp(psi))
+        lpmf = lc + lp
+        return lpmf
+    
+    # MCMC parameter sampling methods
+    def _next_omega(self, r, psi):
+        """Updates omega."""
+        # Clip psi to prevent extreme values that could cause numerical problems
+        psi_clipped = np.clip(psi, -50, 50)
+        omega = self._pg_rnd(self.data.y + r, psi_clipped)
+        # Add small epsilon to omega to prevent division by zero
+        omega = np.maximum(omega, 1e-10)
+        Omega = np.diag(omega)
+        z = (self.data.y - r) / 2 / omega
+        return omega, Omega, z
+
+    def _next_beta(self, z, psi_rnd, psi_bart, phi, 
+                   Omega, beta_mu0, beta_Si0Inv):
+        """Updates beta."""
+        beta_SiInv = self.data.x_fix.T @ Omega @ self.data.x_fix + beta_Si0Inv
+        beta_mu = np.linalg.solve(beta_SiInv,
+                                  self.data.x_fix.T @ Omega @ (z - psi_rnd - psi_bart - phi) + 
+                                  beta_Si0Inv @ beta_mu0)
+        beta = self._mvn_prec_rnd(beta_mu, beta_SiInv)
+        return beta
+    
+    def _next_gamma(self, z, psi_fix, psi_bart, phi, omega, mu, SigmaInv):
+        """Updates gamma."""
+        gamma_SiInv = omega.reshape(self.N,1,1) * \
+            self.data.x_rnd.reshape(self.N,self.n_rnd,1) @ \
+            self.data.x_rnd.reshape(self.N,1,self.n_rnd) + \
+            SigmaInv.reshape(1,self.n_rnd,self.n_rnd)
+        gamma_mu_pre = (omega * (z - psi_fix - psi_bart - phi)).reshape(self.N,1) * \
+            self.data.x_rnd + (SigmaInv @ mu).reshape(1,self.n_rnd)
+        gamma_mu = np.linalg.solve(gamma_SiInv, gamma_mu_pre)
+        gamma = self._mvn_prec_rnd_arr(gamma_mu, gamma_SiInv)            
+        return gamma
+ 
+    def _next_mu(self, gamma, SigmaInv, mu_mu0, mu_Si0Inv):
+        """Updates mu."""
+        mu_SiInv = self.N * SigmaInv + mu_Si0Inv
+        mu_mu = np.linalg.solve(mu_SiInv,
+                                SigmaInv @ np.sum(gamma, axis=0) + 
+                                mu_Si0Inv @ mu_mu0)
+        mu = self._mvn_prec_rnd(mu_mu, mu_SiInv)
+        return mu
+
+    def _next_Sigma(self, gamma, mu, a, nu):    
+        """Updates Sigma."""
+        diff = gamma - mu
+        Sigma = (invwishart.rvs(nu + self.N + self.n_rnd - 1, 
+                                2 * nu * np.diag(a) + diff.T @ diff))\
+            .reshape((self.n_rnd, self.n_rnd))
+        SigmaInv = np.linalg.inv(Sigma)
+        return Sigma, SigmaInv
+
+    def _next_a(self, SigmaInv, nu, A):
+        """Updates a."""
+        a = np.random.gamma((nu + self.n_rnd) / 2, 
+                            1 / (1 / A**2 + nu * np.diag(SigmaInv)))
+        return a
+
+    def _next_phi(self, z, psi_fix, psi_rnd, psi_bart, Omega, Omega_tilde):
+        """Updates phi."""
+        phi_SiInv = Omega + Omega_tilde
+        phi_mu = np.linalg.solve(phi_SiInv, 
+                                 Omega @ (z - psi_fix - psi_rnd - psi_bart))
+        phi = self._mvn_prec_rnd(phi_mu, phi_SiInv)
+        return phi      
+    
+    def _next_sigma2(self, phi, S, sigma2_b0, sigma2_c0):
+        """Updates sigma_mess**2."""
+        b = sigma2_b0 + self.data.N / 2
+        c = sigma2_c0 + phi.T @ S.T @ S @ phi / 2
+        sigma2 = 1 / np.random.gamma(b, 1 / c)
+        return sigma2
+    
+    def _log_target_tau(self, tau, S, phi, sigma2, tau_mu0, tau_si0):
+        """Calculates target density for MH."""
+        if S is None:
+            S = expm(tau * self.data.W)
+        Omega_tilde = S.T @ S / sigma2
+        lt = - phi.T @ Omega_tilde @ phi / 2 - (tau - tau_mu0)**2 / 2 / tau_si0**2
+        return lt, S
+    
+    def _next_tau(self, tau, S, phi, sigma2, tau_mu0, tau_si0, mh_step):
+        """Updates tau."""
+        lt_tau, S = self._log_target_tau(tau, S, phi, sigma2, tau_mu0, tau_si0)
+        tau_star = tau + np.sqrt(mh_step) * np.random.randn()
+        lt_tau_star, S_star = self._log_target_tau(
+            tau_star, None, phi, sigma2, tau_mu0, tau_si0
+            )
+        log_r = np.log(np.random.rand())
+        log_alpha = lt_tau_star - lt_tau
+        if log_r <= log_alpha:
+            tau = tau_star
+            S = np.array(S_star)
+            mh_tau_accept = True
+        else:
+            mh_tau_accept = False
+        return tau, S, mh_tau_accept
+    
+    @staticmethod
+    def _next_h(r, r0, b0, c0):
+        """Updates h."""
+        h = np.random.gamma(r0 + b0, 1/(r + c0))
+        return h
+    
+    @staticmethod
+    @jit(nopython=True)
+    def _next_L(y, r, F):
+        """Updates L."""
+        N = y.shape[0]
+        L = np.zeros((N,))
+        for n in np.arange(N):
+            if y[n]:
+                numer = np.zeros((y[n],))
+                for j in np.arange(y[n]):
+                    numer[j] = F[y[n]-1,j] * r**(j+1)
+                L_p = numer / np.sum(numer)
+                L[n] = np.searchsorted(np.cumsum(L_p), np.random.rand()) + 1
+        return L
+    
+    @staticmethod
+    def _next_r(r0, L, h, psi):
+        """Updates r."""
+        # Clip psi to avoid overflow in exp
+        psi_clipped = np.clip(psi, -50, 50)
+        sum_p = np.sum(np.log1p(np.exp(psi_clipped)))
+        r = np.random.gamma(r0 + np.sum(L), 1 / (h + sum_p))
+        # Ensure r is positive and not too small
+        r = max(r, 1e-5)
+        return r
+    
+    @staticmethod
+    def _rank(lam, ranking_top_m_list):
+        """Computes the rank of each site."""
+        ranking = rankdata(-lam, method='min')
+        ranking_top = np.zeros((lam.shape[0], len(ranking_top_m_list)))
+        for j, m in enumerate(ranking_top_m_list):
+            ranking_top[:,j] = ranking <= m
+        return ranking, ranking_top
+    
+    def _mcmc_chain(
+            self,
+            chainID, 
+            options, bart_options,
+            r0, b0, c0,
+            beta_mu0, beta_Si0Inv,
+            mu_mu0, mu_Si0Inv, nu, A,
+            sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
+            r_init, beta_init, mu_init, Sigma_init,
+            ranking_top_m_list,
+            seed=None):
+        """Markov chain for MCMC simulation for negative binomial model."""
+        
+        # Set unique seed for this chain
+        if seed is not None:
+            np.random.seed(seed)
+        else:
+            np.random.seed(options.seed + chainID)  # Alternative approach
+        
+        # Storage setup
+        file_name = options.model_name + '_draws_chain' + str(chainID + 1) + '.hdf5'
+        if os.path.exists(file_name):
+            os.remove(file_name) 
+        file = h5py.File(file_name, 'a')    
+        
+        lp_store = file.create_dataset('lp_store', (options.nKeep,self.N), dtype='float64')
+        lp_store_tmp = np.zeros((options.nMem,self.N))
+        
+        lam_store = file.create_dataset('lam_store', (options.nKeep,self.N), dtype='float64')
+        lam_store_tmp = np.zeros((options.nMem,self.N))
+        
+        ranking_store = file.create_dataset('ranking_store', (options.nKeep,self.N), dtype='float64')
+        ranking_store_tmp = np.zeros((options.nMem,self.N))
+        
+        ranking_top_store = file.create_dataset('ranking_top_store', 
+                                               (options.nKeep,self.N,len(ranking_top_m_list)), 
+                                               dtype='float64')
+        ranking_top_store_tmp = np.zeros((options.nMem, self.N, len(ranking_top_m_list)))
+        
+        r_store = file.create_dataset('r_store', (options.nKeep,), dtype='float64')
+        r_store_tmp = np.zeros((options.nMem,))
+        
+        f_store = file.create_dataset('f_store', (options.nKeep,self.N), dtype='float64')
+        f_store_tmp = np.zeros((options.nMem,self.N))
+        
+        if self.n_fix:
+            beta_store = file.create_dataset('beta_store', 
+                                           (options.nKeep, self.data.n_fix), 
+                                           dtype='float64')
+            beta_store_tmp = np.zeros((options.nMem, self.data.n_fix))
+            
+        if self.n_rnd:
+            mu_store = file.create_dataset('mu_store', 
+                                         (options.nKeep, self.data.n_rnd), 
+                                         dtype='float64')
+            mu_store_tmp = np.zeros((options.nMem, self.data.n_rnd))
+            
+            sigma_store = file.create_dataset('sigma_store', 
+                                            (options.nKeep, self.data.n_rnd), 
+                                            dtype='float64')
+            sigma_store_tmp = np.zeros((options.nMem, self.data.n_rnd))
+            
+            Sigma_store = file.create_dataset('Sigma_store', 
+                                             (options.nKeep, self.data.n_rnd, self.data.n_rnd), 
+                                             dtype='float64')
+            Sigma_store_tmp = np.zeros((options.nMem, self.data.n_rnd, self.data.n_rnd))
+        
+        if self.data_bart is not None:
+            avg_tree_acceptance_store = np.zeros((options.nIter,))
+            avg_tree_depth_store = np.zeros((options.nIter,))
+                
+            variable_inclusion_props_store = file.create_dataset(
+                'variable_inclusion_props_store', 
+                (options.nKeep, self.data_bart.J), 
+                dtype='float64')
+            variable_inclusion_props_store_tmp = np.zeros((options.nMem, self.data_bart.J))              
+        
+        if self.mess:
+            sigma_mess_store = file.create_dataset('sigma_mess_store', 
+                                                 (options.nKeep,), 
+                                                 dtype='float64')
+            sigma_mess_store_tmp = np.zeros((options.nMem,))
+
+            tau_store = file.create_dataset('tau_store', 
+                                          (options.nKeep,), 
+                                          dtype='float64')
+            tau_store_tmp = np.zeros((options.nMem,))
+            
+            mh_tau_accept_store = np.zeros((options.nIter,))
+        
+        # Initialize parameters
+        r = max(r_init - 0.5 + 1.0 * np.random.rand(), 0.25)
+        
+        if self.n_fix:
+            beta = beta_init - 0.5 + 1 * np.random.rand(self.n_fix,)
+            psi_fix = self.data.x_fix @ beta
+        else:
+            beta = None
+            psi_fix = 0
+            
+        if self.n_rnd:
+            mu = mu_init - 0.5 + 1 * np.random.rand(self.n_rnd,)
+            Sigma = Sigma_init.copy()
+            SigmaInv = np.linalg.inv(Sigma)
+            a = np.random.gamma(1/2, 1/A**2)
+            gamma = mu + (np.linalg.cholesky(Sigma) @ np.random.randn(self.n_rnd,self.N)).T
+            psi_rnd = np.sum(self.data.x_rnd * gamma, axis=1)
+        else:
+            psi_rnd = 0
+            
+        if self.data_bart is not None:
+            forest = bt.Forest(bart_options, self.data_bart)
+            psi_bart = self.data_bart.unscale(forest.y_hat)
+        else:
+            forest = None
+            psi_bart = 0
+        
+        if self.mess:
+            sigma2 = np.sqrt(0.4)
+            tau = -float(0.5 + np.random.rand())
+            S = expm(tau * self.data.W)
+            Omega_tilde = S.T @ S / sigma2         
+            eps = np.sqrt(sigma2) * np.random.randn(self.data.N,)
+            phi = np.linalg.solve(S, eps)
+            mh_step = options.mh_step_initial
+        else:
+            sigma2 = None
+            tau = None       
+            S = None
+            Omega_tilde = None
+            phi = 0
+            mh_step = None
+  
+        psi = psi_fix + psi_rnd + psi_bart + phi
+        
+        # MCMC sampling
+        j = -1
+        ll = 0
+        sample_state = 'burn in'    
+        
+        for i in np.arange(options.nIter):
+            # Update parameters
+            omega, Omega, z = self._next_omega(r, psi)
+            
+            if self.n_fix:
+                beta = self._next_beta(z, psi_rnd, psi_bart, phi, 
+                                      Omega, beta_mu0, beta_Si0Inv)
+                psi_fix = self.data.x_fix @ beta
+                
+            if self.n_rnd:
+                gamma = self._next_gamma(z, psi_fix, psi_bart, phi, 
+                                        omega, mu, SigmaInv)
+                mu = self._next_mu(gamma, SigmaInv, mu_mu0, mu_Si0Inv)
+                Sigma, SigmaInv = self._next_Sigma(gamma, mu, a, nu)
+                a = self._next_a(SigmaInv, nu, A)
+                psi_rnd = np.sum(self.data.x_rnd * gamma, axis=1) 
+                
+            if self.data_bart is not None:
+                sigma_weights = np.sqrt(1/omega)
+                f = z - psi_fix - psi_rnd - phi
+                self.data_bart.update(f, sigma_weights)
+                avg_tree_acceptance_store[i], avg_tree_depth_store[i] = \
+                    forest.update(self.data_bart)
+                psi_bart = self.data_bart.unscale(forest.y_hat)
+                
+            if self.mess:
+                phi = self._next_phi(z, psi_fix, psi_rnd, psi_bart,
+                                    Omega, Omega_tilde)
+            
+            psi = psi_fix + psi_rnd + psi_bart + phi 
+            
+            if self.mess:
+                sigma2 = self._next_sigma2(phi, S, sigma2_b0, sigma2_c0)
+                tau, S, mh_tau_accept_store[i] = self._next_tau(
+                    tau, S, phi, sigma2, tau_mu0, tau_si0, mh_step
+                    )
+                Omega_tilde = S @ S.T / sigma2
+            
+            h = self._next_h(r, r0, b0, c0)
+            L = self._next_L(self.data.y, r, self.F)
+            r = self._next_r(r0, L, h, psi)
+            
+            # Adjust MH step size
+            if self.mess and ((i+1) % options.mh_window) == 0:
+                sl = slice(max(i+1-options.mh_window,0), i+1)
+                mean_accept = mh_tau_accept_store[sl].mean()
+                if mean_accept >= options.mh_target:
+                    mh_step += options.mh_correct
+                else:
+                    mh_step -= options.mh_correct
+                     
+            # Display sampling progress
+            if ((i+1) % options.disp) == 0:  
+                if (i+1) > options.nBurn:
+                    sample_state = 'sampling'
+                verbose = f'Chain {chainID + 1}; iteration: {i + 1} ({sample_state})'
+                if self.data_bart is not None:
+                    sl = slice(max(i+1-100,0),i+1)
+                    ravg_depth = np.round(np.mean(avg_tree_depth_store[sl]), 2)
+                    ravg_acceptance = np.round(np.mean(avg_tree_acceptance_store[sl]), 2)
+                    verbose += f'; avg. tree depth: {ravg_depth}; avg. tree acceptance: {ravg_acceptance}'
+                if self.mess:
+                    verbose += f'; avg. tau acceptance: {mh_tau_accept_store[sl].mean()}'
+                print(verbose)
+                sys.stdout.flush()
+            
+            # Store samples
+            if (i+1) > options.nBurn:                  
+                if ((i+1) % options.nThin) == 0:
+                    j+=1
+                    
+                    lp_store_tmp[j,:] = self._nb_lpmf(self.data.y, psi, r)
+                    lam = np.exp(psi + np.log(r))
+                    lam_store_tmp[j,:] = lam
+                    ranking_store_tmp[j,:], ranking_top_store_tmp[j,:,:] = self._rank(lam, ranking_top_m_list)
+                    r_store_tmp[j] = r
+                    f_store_tmp[j,:] = z - phi
+                    
+                    if self.n_fix:
+                        beta_store_tmp[j,:] = beta
+                        
+                    if self.n_rnd:
+                        mu_store_tmp[j,:] = mu
+                        sigma_store_tmp[j,:] = np.sqrt(np.diag(Sigma))
+                        Sigma_store_tmp[j,:,:] = Sigma
+                        
+                    if self.data_bart is not None:
+                        variable_inclusion_props_store_tmp[j,:] = forest.variable_inclusion()
+                        
+                    if self.mess:
+                        sigma_mess_store_tmp[j] = np.sqrt(sigma2)
+                        tau_store_tmp[j] = tau
+                
+                # Write to storage
+                if (j+1) == options.nMem:
+                    l = ll
+                    ll += options.nMem
+                    sl = slice(l, ll)
+                    
+                    print(f'Storing chain {chainID + 1}')
+                    sys.stdout.flush()
+                    
+                    lp_store[sl,:] = lp_store_tmp
+                    lam_store[sl,:] = lam_store_tmp
+                    ranking_store[sl,:] = ranking_store_tmp
+                    ranking_top_store[sl,:,:] = ranking_top_store_tmp
+                    r_store[sl] = r_store_tmp
+                    f_store[sl,:] = f_store_tmp
+                    
+                    if self.n_fix:
+                        beta_store[sl,:] = beta_store_tmp
+                        
+                    if self.n_rnd:
+                        mu_store[sl,:] = mu_store_tmp
+                        sigma_store[sl,:] = sigma_store_tmp
+                        Sigma_store[sl,:,:] = Sigma_store_tmp
+                        
+                    if self.data_bart is not None:
+                        variable_inclusion_props_store[sl,:] = variable_inclusion_props_store_tmp
+                    
+                    if self.mess:
+                        sigma_mess_store[sl] = sigma_mess_store_tmp
+                        tau_store[sl] = tau_store_tmp
+                    
+                    j = -1 
+        
+        if self.data_bart is not None:
+            file.create_dataset('avg_tree_acceptance_store', data=avg_tree_acceptance_store)
+            file.create_dataset('avg_tree_depth_store', data=avg_tree_depth_store)
+            
+    # Posterior summary methods
+    @staticmethod
+    def _posterior_summary(options, param_name, nParam, nParam2, verbose):
+        """Returns summary of posterior draws of parameters of interest."""
+        headers = ['mean', 'std. dev.', '2.5%', '97.5%', 'Rhat']
+        q = (0.025, 0.975)
+        nSplit = 2
+        
+        draws = np.zeros((options.nChain, options.nKeep, nParam, nParam2))
+        for c in range(options.nChain):
+            file = h5py.File(options.model_name + '_draws_chain' + str(c + 1) + '.hdf5', 'r')
+            draws[c,:,:,:] = np.array(file[param_name + '_store']).reshape((options.nKeep, nParam, nParam2))
+            
+        mat = np.zeros((nParam * nParam2, len(headers)))
+        post_mean = np.mean(draws, axis=(0,1))
+        mat[:, 0] = np.array(post_mean).reshape((nParam * nParam2,))
+        mat[:, 1] = np.array(np.std(draws, axis=(0,1))).reshape((nParam * nParam2,))
+        mat[:, 2] = np.array(np.quantile(draws, q[0], axis=(0,1))).reshape((nParam * nParam2,))
+        mat[:, 3] = np.array(np.quantile(draws, q[1], axis=(0,1))).reshape((nParam * nParam2,))
+        
+        m = int(options.nChain * nSplit)
+        n = int(options.nKeep / nSplit)
+        draws_split = np.zeros((m, n, nParam, nParam2))
+        draws_split[:options.nChain,:,:,:] = draws[:,:n,:,:]
+        draws_split[options.nChain:,:,:,:] = draws[:,n:,:,:]
+        mu_chain = np.mean(draws_split, axis=1, keepdims=True)
+        mu = np.mean(mu_chain, axis=0, keepdims=True)
+        B = (n / (m - 1)) * np.sum((mu_chain - mu)**2, axis=(0,1))
+        ssq = (1 / (n - 1)) * np.sum((draws_split - mu_chain)**2, axis=1)
+        W = np.mean(ssq, axis=0)
+        varPlus = ((n - 1) / n) * W + B / n
+        Rhat = np.empty((nParam, nParam2)) * np.nan
+        W_idx = W > 0
+        Rhat[W_idx] = np.sqrt(varPlus[W_idx] / W[W_idx])
+        mat[:,4] = np.array(Rhat).reshape((nParam * nParam2,))
+            
+        df = pd.DataFrame(mat, columns=headers) 
+        if verbose:
+            print(' ')
+            print(f'{param_name}:')
+            print(df)
+        return df  
+    
+    @staticmethod
+    def _posterior_mean(options, param_name, nParam, nParam2): 
+        """Calculates mean of posterior draws of parameter of interest."""
+        draws = np.zeros((options.nChain, options.nKeep, nParam, nParam2))
+        for c in range(options.nChain):
+            file = h5py.File(options.model_name + '_draws_chain' + str(c + 1) + '.hdf5', 'r')
+            draws[c,:,:,:] = np.array(file[param_name + '_store']).reshape((options.nKeep, nParam, nParam2))
+        post_mean = draws.mean(axis=(0,1))
+        return post_mean
+    
+    def _posterior_fit(self, options, verbose):
+        """Calculates LPPD and WAIC."""
+        lp_draws = np.zeros((options.nChain, options.nKeep, self.N))
+        for c in range(options.nChain):
+            file = h5py.File(options.model_name + '_draws_chain' + str(c + 1) + '.hdf5', 'r')
+            lp_draws[c,:,:] = np.array(file['lp' + '_store'])
+        
+        p_draws = np.exp(lp_draws)
+        lppd = np.log(p_draws.mean(axis=(0,1))).sum()
+        p_waic = lp_draws.var(axis=(0,1)).sum()
+        waic = -2 * (lppd - p_waic)
+        
+        if verbose:
+            print(' ')
+            print(f'LPPD: {lppd}')
+            print(f'WAIC: {waic}')
+        return lppd, waic
+
+    def estimate(
+            self,
+            options, bart_options,
+            r0, b0, c0,
+            beta_mu0, beta_Si0Inv,
+            mu_mu0, mu_Si0Inv, nu, A,
+            sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
+            r_init, beta_init, mu_init, Sigma_init,
+            ranking_top_m_list):
+        """Executes MCMC simulation for all chains and summarizes results."""
+        
+        # Set random seed
+        np.random.seed(options.seed)
+        
+        # Create unique seeds for each chain
+        chain_seeds = np.random.randint(0, 10000, options.nChain)
+        
+        # Start timer
+        tic = time.time()
+        
+        # Run chains sequentially instead of in parallel when nChain > 1
+        if options.nChain > 1:
+            # Run each chain sequentially 
+            for c in range(options.nChain):
+                self._mcmc_chain(
+                    c, 
+                    options, 
+                    bart_options,
+                    r0, b0, c0,
+                    beta_mu0, beta_Si0Inv,
+                    mu_mu0, mu_Si0Inv, nu, A,
+                    sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
+                    r_init, beta_init, mu_init, Sigma_init,
+                    ranking_top_m_list,
+                    seed=chain_seeds[c]
+                )
+        else:
+            # Use Parallel for a single chain (mostly for compatibility)
+            Parallel(n_jobs=1)(
+                delayed(self._mcmc_chain)(
+                    c, 
+                    options, 
+                    bart_options,
+                    r0, b0, c0,
+                    beta_mu0, beta_Si0Inv,
+                    mu_mu0, mu_Si0Inv, nu, A,
+                    sigma2_b0, sigma2_c0, tau_mu0, tau_si0,
+                    r_init, beta_init, mu_init, Sigma_init,
+                    ranking_top_m_list,
+                    seed=chain_seeds[c]
+                ) for c in range(options.nChain)
+            )
+            
+        # End timer
+        toc = time.time() - tic
+        
+        # Calculate posterior summaries
+        post_r = self._posterior_summary(
+            options, 'r', 1, 1, True
+            ).set_index(pd.Index(['r']))
+        
+        post_mean_f = self._posterior_mean(
+            options, 'f', self.N, 1
+            )
+        
+        post_variable_inclusion_props = None
+        if self.data_bart is not None:
+            post_variable_inclusion_props = self._posterior_summary(
+                options, 'variable_inclusion_props',
+                self.data_bart.J, 1, True
+                ).set_index(pd.Index(self.data_bart.var_names))
+                
+        post_beta = None
+        if self.n_fix:
+            post_beta = self._posterior_summary(
+                options, 'beta', self.n_fix, 1, True
+                ).set_index(pd.Index([f'beta[{j}]' for j in range(self.n_fix)]))
+                
+        post_mu = None
+        post_sigma = None
+        post_Sigma = None
+        if self.n_rnd:
+            post_mu = self._posterior_summary(
+                options, 'mu', self.n_rnd, 1, True
+                ).set_index(pd.Index(['mu[' + str(j) + ']' for j in range(self.n_rnd)]))
+            
+            post_sigma = self._posterior_summary(
+                options, 'sigma', self.n_rnd, 1, True
+                ).set_index(pd.Index(['sigma[' + str(j) + ']' for j in range(self.n_rnd)]))
+                
+            post_Sigma = self._posterior_summary(
+                options, 'Sigma', self.n_rnd, self.n_rnd, True
+                ).set_index(pd.Index(['Sigma[' + str(j) + ',' + str(k) + ']' 
+                            for j in range(self.n_rnd) for k in range(self.n_rnd)]))
+                
+        post_sigma_mess = None
+        post_tau = None
+        if self.mess:
+            post_sigma_mess = self._posterior_summary(
+                options, 'sigma_mess', 1, 1, True
+                ).set_index(pd.Index(['sigma_mess']))
+                
+            post_tau = self._posterior_summary(
+                options, 'tau', 1, 1, True
+                ).set_index(pd.Index(['tau']))                
+                
+        # Compute fitted values
+        post_mean_lam = self._posterior_mean(
+            options, 'lam', self.N, 1
+            )
+            
+        residuals = self.data.y - post_mean_lam
+        rmse = np.sqrt(np.mean(residuals**2))
+        mae = np.mean(np.abs(residuals))
+        rmsle = np.sqrt(np.mean((np.log1p(self.data.y) - np.log1p(post_mean_lam))**2))
+            
+        # Compute rankings
+        post_mean_ranking = self._posterior_mean(
+            options, 'ranking', self.N, 1
+            )
+            
+        post_mean_ranking_top = np.zeros((self.N, len(ranking_top_m_list)))
+        for c in range(options.nChain):
+            file = h5py.File(options.model_name + '_draws_chain' + str(c + 1) + '.hdf5', 'r')
+            post_mean_ranking_top += np.mean(np.array(file['ranking_top_store']), axis=0) / options.nChain
+            
+        # Compute goodness-of-fit statistics
+        lppd, waic = self._posterior_fit(options, True)
+            
+        # Create results instance
+        res = Results(
+            options, bart_options, toc, 
+            lppd, waic,
+            post_mean_lam, 
+            rmse, mae, rmsle,
+            post_mean_ranking, 
+            post_mean_ranking_top, ranking_top_m_list,
+            post_r, post_mean_f, 
+            post_beta,
+            post_mu, post_sigma, post_Sigma,
+            post_variable_inclusion_props,
+            post_sigma_mess, post_tau
+            )
+            
+        # Delete MCMC draws
+        if options.delete_draws:
+            for c in range(options.nChain):
+                file_name = options.model_name + '_draws_chain' + str(c + 1) + '.hdf5'
+                os.remove(file_name)        
+        
+        return res
+
+
+#####################################
+# Data Processing and Model Execution
+#####################################
 
 def load_and_prepare_data():
-
+    """
+    Load and prepare the Montreal intersection data for modeling
+    """
     data = pd.read_csv("data/data_final.csv", sep=";")
     
     # Replace NaN values in ln_distdt with 0
@@ -29,23 +891,9 @@ def load_and_prepare_data():
     # Include existing spatial columns
     spatial_cols = ['x', 'y']
     
-    # Include borough as categorical variable if available
-    borough_dummies = pd.DataFrame()
-    if 'borough' in data.columns:
-        data['borough'] = data['borough'].astype('category')
-        # Create dummy variables for borough
-        borough_dummies = pd.get_dummies(data['borough'], prefix='borough')
-    else:
-        print("Variable 'borough' not found in the data")
-    
     # Base features (non-spatial)
-    feature_cols = ['ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'traffic_10000', 'ln_cti', 'ln_cli', 'ln_cri',"ln_distdt",
-                    'total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
-                    'commercial', 'number_of_', 'of_exclusi', 'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r',
-                    'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
-                    'parking', 'north_veh', 'north_ped', 'east_veh', 'east_ped', 'south_veh', 'south_ped', 'west_veh', 'west_ped']
-        
-
+    feature_cols = ['ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'ln_cti', 'ln_cli', 'ln_cri']
+    
     # Check which columns actually exist in the data
     feature_cols = [col for col in feature_cols if col in data.columns]
     spatial_cols = [col for col in spatial_cols if col in data.columns]
@@ -59,93 +907,79 @@ def load_and_prepare_data():
         if col in X_base.columns:
             X_base[f'{col}_squared'] = X_base[col] ** 2
 
-    # Add borough dummy variables if available
-    if not borough_dummies.empty:
-        X_features = pd.concat([X_base, X_spatial, borough_dummies], axis=1)
-    else:
-        X_features = pd.concat([X_base, X_spatial], axis=1)
+    # No random effects or borough dummies
+    X_rnd = None
+    X_features = pd.concat([X_base, X_spatial], axis=1)
     
     return {
         'X': X_features, 
-        'X_non_spatial': X_base,  # Add non-spatial features separately
-        'X_spatial': X_spatial,   # Add spatial features separately
+        'X_non_spatial': X_base,
+        'X_spatial': X_spatial,
         'y': data['acc'], 
         'int_no': data['int_no'],
-        'pi': data['pi']
+        'pi': data['pi'],
+        'X_rnd': None,  # No random effects
+        'borough_codes': None,  # No borough codes needed
+        'borough_dummies': None  # No borough dummies
     }
 
 
-def create_spatial_weight_matrix(X_spatial):
+def create_spatial_weight_matrix(X_spatial, k_neighbors=5):
     """
-    Create a spatial weight matrix based on distances between coordinates.
-    Uses GPU acceleration if available.
+    Create a spatial weight matrix based on k-nearest neighbors.
+    Optimized version with optional GPU acceleration.
+    
+    Args:
+        X_spatial: DataFrame containing x and y coordinates
+        k_neighbors: Number of nearest neighbors to use
+        use_gpu: Whether to use GPU acceleration if available
     """
     # Extract coordinates
     coords = X_spatial[['x', 'y']].values
-    print(f"Coordinates shape: {coords.shape}")  # Debug shape
+    print(f"Coordinates shape: {coords.shape}")
+    n = len(coords)
     
-    # Use GPU if available
-    if torch.cuda.is_available():
-        coords_tensor = torch.tensor(coords, device='cuda', dtype=torch.float32)
-        
-        # Calculate pairwise distances on GPU
-        n = len(coords_tensor)
-        distances = torch.zeros((n, n), device='cuda')
-        
-        # More efficient batched calculation to avoid potential OOM errors
-        batch_size = 100  # Adjust based on GPU memory
-        for i in range(0, n, batch_size):
-            end_idx = min(i + batch_size, n)
-            batch_coords = coords_tensor[i:end_idx]
-            
-            # Calculate distances for this batch to all other points
-            # Reshape for broadcasting: (batch, 1, dims) - (1, all_points, dims)
-            diff = batch_coords.unsqueeze(1) - coords_tensor.unsqueeze(0)
-            batch_distances = torch.sqrt((diff ** 2).sum(dim=2))
-            distances[i:end_idx] = batch_distances
-        
-        # Create weight matrix based on distance bands
-        W = torch.zeros((n, n), device='cuda')
-        
-        # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 200)] = 1.0
-        W[(distances > 200) & (distances <= 400)] = 0.5
-        W[(distances > 400) & (distances <= 600)] = 0.25
-        
-        # Row-normalize the weight matrix
-        row_sums = W.sum(dim=1, keepdim=True)
-        row_sums[row_sums == 0] = 1.0  # Avoid division by zero
-        W = W / row_sums
-        
-        # Convert back to numpy
-        W = W.cpu().numpy()
-    else:
-        # Original CPU implementation
-        distances = squareform(pdist(coords, 'euclidean'))
-        n = len(X_spatial)
-        W = np.zeros((n, n))
-        W[(distances > 0) & (distances <= 200)] = 1.0
-        W[(distances > 200) & (distances <= 400)] = 0.5
-        W[(distances > 400) & (distances <= 600)] = 0.25
-        
-        row_sums = W.sum(axis=1)
-        W[row_sums > 0] = W[row_sums > 0] / row_sums[row_sums > 0].reshape(-1, 1)
+    # Define weights for nearest neighbors (in descending order)
+    weights = [1.0, 0.75, 0.5, 0.5, 0.25][:k_neighbors]
     
+    # Use scikit-learn's NearestNeighbors which is optimized for KNN searches
+    from sklearn.neighbors import NearestNeighbors
+    
+    # Initialize weight matrix
+    W = np.zeros((n, n))
+    
+    # Find k+1 nearest neighbors (including self)
+    nbrs = NearestNeighbors(n_neighbors=k_neighbors+1, algorithm='ball_tree').fit(coords)
+    distances, indices = nbrs.kneighbors(coords)
+    
+    # Assign weights to neighbors (excluding self)
+    for i in range(n):
+        # Skip the first neighbor (which is the point itself)
+        for j, neighbor_idx in enumerate(indices[i][1:k_neighbors+1]):
+            W[i, neighbor_idx] = weights[j]
+    
+    # Row-normalize the weight matrix
+    row_sums = W.sum(axis=1)
+    non_zero_rows = row_sums > 0
+    W[non_zero_rows] = W[non_zero_rows] / row_sums[non_zero_rows].reshape(-1, 1)
+    
+    print(f"Created KNN spatial weight matrix with {np.count_nonzero(W)} non-zero elements")
     return W
 
-
-def select_features_with_lasso(X, y):
+def select_features_with_lasso(X, y, borough_dummies=None):
     """
-    Select features using Lasso regression (CPU implementation)
-    Always keeps specified important features regardless of Lasso selection
+    Select features using Lasso regression
+    Always keeps specified important features
     """
     # List of features to always keep
-    important_features = ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi', 'ln_cti_squared', 'ln_cri_squared', 'ln_cli_squared', 'ln_pi_squared', 'ln_fri_squared', 'ln_fli_squared', 'ln_fi_squared']
+    important_features = ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi', 
+                         'ln_cti_squared', 'ln_cri_squared', 'ln_cli_squared', 'ln_pi_squared', 
+                         'ln_fri_squared', 'ln_fli_squared', 'ln_fi_squared']
     
     # Filter to only include features that exist in the dataset
     important_features = [f for f in important_features if f in X.columns]
     
-    # Original CPU implementation
+    # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
@@ -167,32 +1001,21 @@ def select_features_with_lasso(X, y):
 
 def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     """
-    Run Negative Binomial model with fixed parameters and spatial correlation
-    
-    Args:
-        X_train: Training features
-        y_train: Training target
-        X_test: Test features
-        y_test: Test target
-        pi_train: Exposure variable for training
-        W_train: Spatial weight matrix for training
-    
-    Returns:
-        results: Results object with model outputs
+    Run Negative Binomial model with fixed parameters, random effects for borough, and spatial correlation
     """
     # Convert to numpy arrays
     X_train_np = X_train.values.astype(np.float64)
-    y_train_np = y_train.values.astype(np.int64)  # Changed to int64 to fix the error
+    y_train_np = y_train.values.astype(np.int64)
     
-    # Create Data object for NegativeBinomial model (using X as fixed effects)
+    # Create Data object for NegativeBinomial model
     nb_data = Data(y=y_train_np, x_fix=X_train_np, x_rnd=None, W=W_train)
     
     # Initialize model
     nb_model = NegativeBinomial(nb_data, data_bart=None)
     
-    # Define model options
+    # Define model options - reduced settings for faster computation
     options = Options(
-        model_name='fixed',
+        model_name='fixed_random',
         nChain=1, nBurn=200, nSample=200, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
@@ -206,11 +1029,11 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     beta_mu0 = np.zeros(n_fix)
     beta_Si0Inv = 1e-2 * np.eye(n_fix)
     
-    # Initialize with zeros since we don't have random effects
+    # Random effects parameters (for borough)
     mu_mu0 = np.zeros(0)
     mu_Si0Inv = np.eye(0)
-    nu = 2
-    A = np.array([])
+    nu = 3  # Degrees of freedom for inverse-Wishart
+    A = np.ones(0)
     
     # Spatial parameters
     sigma2_b0 = 1e-2
@@ -248,19 +1071,29 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
             print("Warning: NaN values detected in beta coefficients. Using zeros instead.")
             beta_mean = np.zeros_like(beta_mean)
         
-        # For negative binomial, we need to use the exp(X*beta) * r formula for predictions
+        # Get random effects mean if available
+        mu_mean = None
+        if hasattr(results, 'post_mu') and results.post_mu is not None:
+            mu_mean = results.post_mu['mean'].values[0] if results.post_mu.shape[0] > 0 else 0
+            
+        # For negative binomial, calculate lambda = exp(X*beta) * r
         r_mean = results.post_r['mean'].values[0]
-        # Handle potential NaN in r
         if np.isnan(r_mean):
             print("Warning: NaN value detected in r parameter. Using 1.0 instead.")
             r_mean = 1.0
             
+        # Fixed effects contribution
         psi_test = X_test_np @ beta_mean
         
-        # Apply stronger clipping to prevent overflow
-        psi_test = np.clip(psi_test, -25, 25)  # More conservative clipping
+        # Random effects contribution (if available)
+        # For test set predictions, we use the mean random effect across all boroughs
+        if mu_mean is not None:
+            psi_test += mu_mean
         
-        # Use a more stable computation of the expected value
+        # Apply clipping to prevent overflow
+        psi_test = np.clip(psi_test, -25, 25)
+        
+        # Calculate expected value
         lam_test = np.exp(psi_test) * r_mean
         
         # Final safeguard against NaN or infinity values
@@ -272,38 +1105,12 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
         
     except Exception as e:
         print(f"Error in model estimation: {e}")
-        # Return a simple results object with default predictions if model fails
-        # This ensures the cross-validation continues even if one fold fails
         results = None
-        return results
-    
+        
     return results
 
 
-def save_results(int_no, y_true, y_pred, pi, model_name):
-    results_path = "results"
-    os.makedirs(results_path, exist_ok=True)
-    
-    # Create results DataFrame
-    results = pd.DataFrame({
-        'int_no': int_no,
-        'true_counts': y_true,
-        'pred_counts': y_pred,
-        'true_rate': y_true / pi,
-        'pred_rate': y_pred / pi,
-        'pi': pi
-    })
-    
-    # Save prediction summary
-    results.to_csv(os.path.join(results_path, f"{model_name}_cv_results.csv"), index=False)
-    
-    # Create and save intersection ranking
-    rankings = results[['int_no', 'pred_counts']].sort_values(by='pred_counts', ascending=False)
-    rankings['ranking'] = range(1, len(rankings) + 1)
-    rankings.to_csv(os.path.join(results_path, f"{model_name}_intersections_cv_ranking.csv"), index=False)
-
-
-def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
+def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, borough_dummies=None, k=5):
     """
     Run k-fold cross-validation with the Negative Binomial model
     """
@@ -313,7 +1120,7 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
     
     # Initialize lists to store results
     results_list = []
-    all_metrics = []  # Change to a list instead of empty DataFrame
+    all_metrics = []
     combined_results = pd.DataFrame()
     
     # Make sure int_no is present in X_spatial
@@ -343,24 +1150,21 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
         # Get spatial features for this fold
         X_train_spatial = X_spatial.iloc[train_idx]
         
-        # Print shapes for debugging
-        print(f"Train shapes - X_non_spatial: {X_train_non_spatial.shape}, X_spatial: {X_train_spatial.shape}, y: {y_train.shape}")
-        print(f"Test shapes - X_non_spatial: {X_test_non_spatial.shape}, X_spatial: {X_spatial.iloc[test_idx].shape}, y: {y_test.shape}")
-        
         # Select features using Lasso on non-spatial features
         selected_features = select_features_with_lasso(X_train_non_spatial, y_train)
         X_train_selected = X_train_non_spatial[selected_features]
         X_test_selected = X_test_non_spatial[selected_features]
         
-        # Combine selected non-spatial features with necessary spatial features for modeling
-        X_train_combined = pd.concat([X_train_selected, X_train_spatial[['x', 'y']]], axis=1)
-        X_test_combined = pd.concat([X_test_selected, X_spatial.iloc[test_idx][['x', 'y']]], axis=1)
+        # Use selected features directly (no borough dummies)
+        X_train_combined = X_train_selected.copy()
+        X_test_combined = X_test_selected.copy()
         
         # Create spatial weight matrix for training data
         W_train = create_spatial_weight_matrix(X_train_spatial)
         
-        # Run Negative Binomial model
-        fold_results = run_nb_model(X_train_combined, y_train, X_test_combined, y_test, pi_train, W_train)
+        # Run Negative Binomial model (without random effects)
+        fold_results = run_nb_model(X_train_combined, y_train, X_test_combined, y_test, 
+                                  pi_train, W_train)
         
         # Skip this fold if model failed
         if fold_results is None:
@@ -389,7 +1193,7 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
         mse = mean_squared_error(y_test, y_pred)
         rmse = np.sqrt(mse)
         
-        # Add evaluation metrics to list instead of concatenating DataFrames
+        # Add evaluation metrics to list
         all_metrics.append({
             'fold': i,
             'mae': mae,
@@ -408,17 +1212,19 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
     # Calculate averages
     avg_metrics = all_metrics[['mae', 'mse', 'rmse']].mean()
     
-    # Display results for all folds
+    # Display results
     print("\n========== Results by fold ==========")
     print(all_metrics)
     
-    # Display averages
     print("\n========== Average metrics ==========")
     print(f"Average MAE: {avg_metrics['mae']}")
     print(f"Average MSE: {avg_metrics['mse']}")
     print(f"Average RMSE: {avg_metrics['rmse']}")
     
-    # Create a visualization of fold results
+    # Create visualization of fold results
+    results_path = "results"
+    os.makedirs(results_path, exist_ok=True)
+    
     plt.figure(figsize=(12, 8))
     all_metrics_long = pd.melt(all_metrics, id_vars=['fold'], value_vars=['mae', 'mse', 'rmse'])
     
@@ -430,115 +1236,523 @@ def run_cross_validation(X_non_spatial, X_spatial, y, int_no, pi, k=5):
     plt.tight_layout()
     
     # Save plot
-    plt.savefig(os.path.join("results", "nb_model_cv_metrics.png"))
+    plt.savefig(os.path.join(results_path, "nb_model_cv_metrics.png"))
     
     # Save combined results
-    combined_results.to_csv(os.path.join("results", "nb_model_combined_cv_results.csv"), index=False)
+    combined_results.to_csv(os.path.join(results_path, "nb_model_combined_cv_results.csv"), index=False)
     
     # Create and save combined intersection ranking
     combined_rankings = combined_results[['int_no', 'pred_counts']].sort_values(by='pred_counts', ascending=False)
     combined_rankings['ranking'] = range(1, len(combined_rankings) + 1)
-    combined_rankings.to_csv(os.path.join("results", "nb_model_combined_intersections_cv_ranking.csv"), index=False)
+    combined_rankings.to_csv(os.path.join(results_path, "nb_model_combined_intersections_cv_ranking.csv"), index=False)
     
     return {
         'results_per_fold': results_list,
         'metrics_per_fold': all_metrics,
-        'average_metrics': avg_metrics
+        'average_metrics': avg_metrics,
+        'combined_results': combined_results
     }
 
 
-def plot_results(combined_results, X_spatial, int_no=None):
-    """Plot various visualizations of the model results"""
-    results_path = "results"
-    os.makedirs(results_path, exist_ok=True)
+def plot_spatial_correlation_network(spatial_results, results, W, results_path, correlation_threshold=0.5):
+    """
+    Create a network visualization showing the estimated spatial correlation between intersections
+    based on the model's tau and sigma_mess parameters.
     
-    # Create figure for predicted vs actual counts
-    plt.figure(figsize=(10, 6))
-    plt.scatter(combined_results['true_counts'], combined_results['pred_counts'], alpha=0.6)
-    plt.plot([0, max(combined_results['true_counts'])], [0, max(combined_results['true_counts'])], 'r--')
-    plt.xlabel('Observed Accident Counts')
-    plt.ylabel('Predicted Accident Counts')
-    plt.title('Observed vs Predicted Accident Counts')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_path, 'predicted_vs_actual.png'))
-    
-    # Plot spatial distribution of accidents
-    if 'x' in X_spatial.columns and 'y' in X_spatial.columns:
-        # Create a DataFrame with int_no, x, y by merging information
-        spatial_results = pd.DataFrame()
+    Args:
+        spatial_results: DataFrame containing int_no, x, y, and pred_counts
+        results: Results object from the Negative Binomial model
+        W: The spatial weight matrix used in modeling
+        results_path: Path to save the visualization
+        correlation_threshold: Minimum correlation to display a connection
+    """
+    try:
+        import networkx as nx
+        from scipy.linalg import expm
+        print("Creating estimated spatial correlation network visualization...")
         
-        # Group by int_no and calculate mean predicted counts
-        pred_by_int = combined_results.groupby('int_no')['pred_counts'].mean().reset_index()
-        
-        # Use provided int_no if available and not already in X_spatial
-        if 'int_no' not in X_spatial.columns and int_no is not None:
-            X_spatial_with_int = X_spatial.copy()
-            X_spatial_with_int['int_no'] = int_no.values
-        else:
-            X_spatial_with_int = X_spatial
-        
-        # Only proceed if we can match int_no with spatial coordinates
-        if 'int_no' in X_spatial_with_int.columns:
-            spatial_mapping = X_spatial_with_int[['int_no', 'x', 'y']].drop_duplicates('int_no').set_index('int_no')
+        # Check if spatial parameters are available
+        if results.post_tau is None or results.post_sigma_mess is None:
+            print("Cannot create correlation network: spatial parameters not available in model results")
+            return
             
-            # Merge spatial coordinates with predictions
-            spatial_results = pd.merge(
-                pred_by_int, 
-                spatial_mapping.reset_index(), 
-                on='int_no', how='inner'
-            )
-        else:
-            # Try to match by index position if int_no values are available in order
-            if hasattr(X_spatial_with_int, 'index') and X_spatial_with_int.index.name == 'int_no':
-                spatial_results = pd.merge(
-                    pred_by_int,
-                    X_spatial_with_int.reset_index(),
-                    on='int_no', how='inner'
-                )
-            else:
-                print("Warning: Cannot create spatial plot - unable to match int_no with coordinates")
+        # Extract spatial parameters
+        tau = results.post_tau['mean'].values[0]
+        sigma_mess = results.post_sigma_mess['mean'].values[0]
+        print(f"Using estimated spatial parameters: tau={tau:.4f}, sigma_mess={sigma_mess:.4f}")
         
-        # Only create plot if we have data
-        if not spatial_results.empty:
-            plt.figure(figsize=(12, 10))
-            plt.scatter(spatial_results['x'], spatial_results['y'], 
-                       c=spatial_results['pred_counts'], cmap='viridis', 
-                       s=50, alpha=0.8)
-            plt.colorbar(label='Predicted Accident Count')
-            plt.xlabel('X Coordinate')
-            plt.ylabel('Y Coordinate')
-            plt.title('Spatial Distribution of Predicted Accident Counts')
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(results_path, 'spatial_distribution.png'))
-        else:
-            print("Skipping spatial plot: Could not match int_no with spatial coordinates")
+        # Calculate spatial correlation matrix
+        S = expm(tau * W)
+        sigma2 = sigma_mess**2
+        precision_matrix = S.T @ S / sigma2
+        
+        # Convert precision to covariance
+        try:
+            covariance_matrix = np.linalg.inv(precision_matrix)
+        except np.linalg.LinAlgError:
+            covariance_matrix = np.linalg.pinv(precision_matrix)
+        
+        # Convert to correlation matrix
+        diag_values = np.abs(np.diag(covariance_matrix))  # Use absolute values to avoid issues
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(diag_values))
+        correlation_matrix = np.clip(D_sqrt_inv @ covariance_matrix @ D_sqrt_inv, -1, 1)
+        
+        # Create network graph
+        G = nx.Graph()
+        
+        # Get subset of intersections
+        int_indices = spatial_results.index.tolist()[:correlation_matrix.shape[0]]
+        
+        # Add nodes (intersections)
+        for i, row in spatial_results.iterrows():
+            if i < len(int_indices):
+                G.add_node(i, pos=(row['x'], row['y']), 
+                          accidents=row['pred_counts'],
+                          int_no=row['int_no'])
+        
+        # Add edges for correlated intersections
+        n = min(len(int_indices), correlation_matrix.shape[0])
+        edge_weights = []
+        
+        # Store all correlations for finding top pairs
+        all_correlations = []
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                corr = abs(correlation_matrix[i, j])
+                
+                # Store all correlations with intersection IDs
+                if i < len(int_indices) and j < len(int_indices):
+                    # FIX: Make sure we're accessing the correct indices in spatial_results
+                    int_i = spatial_results.iloc[int_indices[i]]['int_no'] if i < len(int_indices) else f"idx_{i}"
+                    int_j = spatial_results.iloc[int_indices[j]]['int_no'] if j < len(int_indices) else f"idx_{j}"
+                    all_correlations.append((int_i, int_j, corr))
+                
+                if corr > correlation_threshold:
+                    G.add_edge(i, j, weight=corr)
+                    edge_weights.append(corr)
+        
+        # Save top 30 most correlated intersection pairs
+        if all_correlations:
+            # Sort by correlation strength (descending)
+            all_correlations.sort(key=lambda x: x[2], reverse=True)
+            
+            # Take top 30 (or fewer if there aren't 30)
+            top_30 = all_correlations[:30]
+            
+            # Create DataFrame and save to CSV
+            top_corr_df = pd.DataFrame(top_30, columns=['Intersection_1', 'Intersection_2', 'Correlation'])
+            top_corr_path = os.path.join(results_path, 'top_30_correlated_intersections.csv')
+            top_corr_df.to_csv(top_corr_path, index=False)
+            print(f"Top 30 correlated intersection pairs saved to {top_corr_path}")
+            
+            # Also print the top 10 to console
+            print("\nTop 10 most correlated intersection pairs:")
+            for i, (int1, int2, corr) in enumerate(top_30[:10], 1):
+                print(f"{i}. Intersections {int1} and {int2}: correlation = {corr:.4f}")
+        
+        if not edge_weights:
+            print(f"No correlations above threshold {correlation_threshold}. Try lowering the threshold.")
+            return
+            
+        # Create visualization
+        fig, ax = plt.subplots(figsize=(15, 12))
+        pos = nx.get_node_attributes(G, 'pos')
+        
+        # Draw nodes (small and transparent)
+        nx.draw_networkx_nodes(G, pos, 
+                              node_size=10,
+                              node_color='lightgray',
+                              alpha=0.5,
+                              ax=ax)
+        
+        # Draw edges with color based on correlation strength
+        edge_weights_list = [G[u][v]['weight'] for u, v in G.edges()]
+        nx.draw_networkx_edges(G, pos, 
+                              width=1.0,
+                              alpha=0.7,
+                              edge_color=edge_weights_list, 
+                              edge_cmap=plt.cm.YlOrRd, 
+                              ax=ax)
+        
+        # Add colorbar
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.YlOrRd, 
+                                  norm=plt.Normalize(vmin=correlation_threshold, 
+                                                    vmax=max(edge_weights)))
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='Estimated Spatial Correlation (absolute value)')
+        
+        # Turn axes on and add labels
+        plt.axis('on')
+        plt.xlabel('X Coordinate')
+        plt.ylabel('Y Coordinate')
+        
+        # Add grid for better readability
+        plt.grid(True, alpha=0.3, linestyle='--')
+        
+        plt.title(f'Estimated Spatial Correlation Network (tau={tau:.3f}, sigma={sigma_mess:.3f})')
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'estimated_correlation_network.png'), dpi=300)
+        
+        print("Estimated spatial correlation network visualization saved.")
+        
+    except ImportError:
+        print("NetworkX library not available. Install with 'pip install networkx' to enable network visualization.")
+    except Exception as e:
+        print(f"Error creating spatial correlation network: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def report_model_coefficients(results, X_columns, results_path="results"):
+    """
+    Create a clear, formatted table of model coefficients and save to CSV.
+    Also creates a coefficient plot with confidence intervals.
     
-    print("Plots saved as PNG files in the results directory.")
+    Args:
+        results: Model results object containing posterior samples
+        X_columns: Column names for the design matrix
+        results_path: Path to save results
+    """
+    if not hasattr(results, 'post_beta') or results.post_beta is None:
+        print("No coefficient information available in model results")
+        return
+    
+    # Create coefficient table
+    coef_table = results.post_beta.copy()
+    coef_table.index = X_columns
+    
+    # Rename columns for clarity
+    coef_table = coef_table.rename(columns={
+        'mean': 'Estimate',
+        'std. dev.': 'Std. Error',
+        '2.5%': 'Lower 95% CI',
+        '97.5%': 'Upper 95% CI'
+    })
+    
+    # Add a column for significance
+    coef_table['Significant'] = ((coef_table['Lower 95% CI'] > 0) & 
+                                (coef_table['Upper 95% CI'] > 0)) | \
+                               ((coef_table['Lower 95% CI'] < 0) & 
+                                (coef_table['Upper 95% CI'] < 0))
+    
+    # Sort by absolute effect size
+    coef_table = coef_table.sort_values(by='Estimate', key=abs, ascending=False)
+    
+    # Print nicely formatted table to console
+    pd.set_option('display.max_rows', None)  # Show all rows
+    pd.set_option('display.width', 120)      # Wider display
+    pd.set_option('display.precision', 4)    # Show 4 decimal places
+    
+    print("\n=== Model Coefficients ===")
+    print(coef_table[['Estimate', 'Std. Error', 'Lower 95% CI', 'Upper 95% CI', 'Significant']])
+    
+    # Save to CSV
+    os.makedirs(results_path, exist_ok=True)
+    coef_table.to_csv(os.path.join(results_path, "model_coefficients.csv"))
+    print(f"Coefficient table saved to {os.path.join(results_path, 'model_coefficients.csv')}")
+    
+    # Create coefficient plot
+    plt.figure(figsize=(12, max(8, len(coef_table) * 0.3)))
+    
+    # Plot coefficients and confidence intervals
+    y_pos = np.arange(len(coef_table))
+    
+    # Instead of using a list of colors in errorbar, plot each point separately
+    for i, (idx, row) in enumerate(coef_table.iterrows()):
+        color = 'darkred' if row['Significant'] else 'darkblue'
+        plt.errorbar(
+            x=row['Estimate'],
+            y=i,
+            xerr=[[row['Estimate'] - row['Lower 95% CI']], 
+                  [row['Upper 95% CI'] - row['Estimate']]],
+            fmt='o',
+            capsize=5,
+            color=color,
+            alpha=0.7
+        )
+    
+    # Add vertical line at zero
+    plt.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+    
+    # Add labels and title
+    plt.yticks(y_pos, coef_table.index)
+    plt.xlabel('Coefficient Estimate')
+    plt.title('Model Coefficients with 95% Confidence Intervals')
+    plt.grid(axis='x', alpha=0.3)
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_path, "coefficient_plot.png"), dpi=300)
+    print(f"Coefficient plot saved to {os.path.join(results_path, 'coefficient_plot.png')}")
+
+
+def plot_accident_heatmap(spatial_results, results_path="results"):
+    """
+    Create a heatmap visualization of predicted accidents using x-y coordinates.
+    
+    Args:
+        spatial_results: DataFrame containing x, y coordinates and predicted accident counts
+        results_path: Path to save the visualization
+    """
+    try:
+        print("Creating accident prediction heatmap...")
+        
+        # Create figure
+        plt.figure(figsize=(14, 12))
+        
+        # Create scatter plot with points colored by predicted accident count
+        scatter = plt.scatter(
+            spatial_results['x'], 
+            spatial_results['y'],
+            c=spatial_results['pred_counts'],
+            cmap='YlOrRd',
+            alpha=0.7,
+            s=30,  # Point size
+            edgecolors='black',
+            linewidths=0.5
+        )
+        
+        # Add colorbar
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Predicted Accident Count')
+        
+        # Add title and labels
+        plt.title('Spatial Distribution of Predicted Accidents')
+        plt.xlabel('X Coordinate')
+        plt.ylabel('Y Coordinate')
+        
+        # Add grid for reference
+        plt.grid(alpha=0.3)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'accident_prediction_heatmap.png'), dpi=300)
+        print(f"Accident prediction heatmap saved to {os.path.join(results_path, 'accident_prediction_heatmap.png')}")
+        
+    except Exception as e:
+        print(f"Error creating accident heatmap: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def plot_predicted_vs_actual(results, results_path="results"):
+    """
+    Create scatter plots comparing predicted vs actual accident counts.
+    
+    Args:
+        results: DataFrame containing actual and predicted accident counts
+        results_path: Path to save the visualization
+    """
+    try:
+        print("Creating predicted vs actual comparison plots...")
+        os.makedirs(results_path, exist_ok=True)
+        
+        # Extract data
+        if isinstance(results, pd.DataFrame):
+            # If results is already a DataFrame with the right columns
+            df = results
+        elif hasattr(results, 'test_predictions') and hasattr(results, 'test_actual'):
+            # If results is a model Results object
+            df = pd.DataFrame({
+                'actual': results.test_actual,
+                'predicted': results.test_predictions
+            })
+        else:
+            # For full model results
+            df = pd.DataFrame({
+                'actual': results.data.y,
+                'predicted': results.post_mean_lam
+            })
+        
+        # Create scatter plot
+        plt.figure(figsize=(10, 8))
+        plt.scatter(df['actual'], df['predicted'], alpha=0.6, edgecolors='k', linewidths=0.5)
+        
+        # Add perfect prediction line
+        max_val = max(df['actual'].max(), df['predicted'].max()) * 1.1
+        plt.plot([0, max_val], [0, max_val], 'r--', label='Perfect prediction')
+        
+        # Add regression line
+        from scipy import stats
+        slope, intercept, r_value, p_value, std_err = stats.linregress(df['actual'], df['predicted'])
+        plt.plot(
+            [0, max_val], 
+            [intercept, intercept + slope * max_val], 
+            'b-', 
+            label=f'Regression line (R² = {r_value**2:.3f})'
+        )
+        
+        # Add labels and title
+        plt.xlabel('Actual Accident Count')
+        plt.ylabel('Predicted Accident Count')
+        plt.title('Predicted vs Actual Accident Counts')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        # Set equal aspect ratio
+        plt.axis('equal')
+        plt.xlim(0, max_val)
+        plt.ylim(0, max_val)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'predicted_vs_actual.png'), dpi=300)
+        
+        # Create residual plot
+        plt.figure(figsize=(10, 8))
+        residuals = df['predicted'] - df['actual']
+        plt.scatter(df['actual'], residuals, alpha=0.6, edgecolors='k', linewidths=0.5)
+        plt.axhline(y=0, color='r', linestyle='--')
+        
+        # Add labels and title
+        plt.xlabel('Actual Accident Count')
+        plt.ylabel('Residual (Predicted - Actual)')
+        plt.title('Residual Plot')
+        plt.grid(alpha=0.3)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'residual_plot.png'), dpi=300)
+        
+        # Create histogram of residuals
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals, bins=30, alpha=0.7, edgecolor='black')
+        plt.axvline(x=0, color='r', linestyle='--')
+        plt.xlabel('Residual (Predicted - Actual)')
+        plt.ylabel('Frequency')
+        plt.title('Histogram of Residuals')
+        plt.grid(alpha=0.3)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'residual_histogram.png'), dpi=300)
+        
+        print(f"Predicted vs actual plots saved to {results_path}")
+        
+        # Return some statistics
+        return {
+            'r_squared': r_value**2,
+            'mean_residual': residuals.mean(),
+            'residual_std': residuals.std()
+        }
+        
+    except Exception as e:
+        print(f"Error creating predicted vs actual plots: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def main():
+    """Main function to run the entire workflow"""
     # Create results directory if it doesn't exist
     os.makedirs("results", exist_ok=True)
     
     # Load and prepare data
+    print("Loading and preparing data...")
     data = load_and_prepare_data()
     
-    # Run 5-fold cross validation with NegativeBinomial model
-    cv_results = run_cross_validation(data['X_non_spatial'], data['X_spatial'], data['y'], data['int_no'], data['pi'], k=5)
+    # First fit the full model to the entire dataset
+    print("\n========== Full Model on Entire Dataset ==========")
     
-    # Load the combined results for plotting
-    combined_results_path = os.path.join("results", "nb_model_combined_cv_results.csv")
-    if os.path.exists(combined_results_path):
-        combined_results = pd.read_csv(combined_results_path)
-        # Pass int_no as an additional parameter to plot_results
-        plot_results(combined_results, data['X_spatial'], data['int_no'])
+    # Select features using Lasso on non-spatial features
+    selected_features = select_features_with_lasso(data['X_non_spatial'], data['y'])
+    X_selected = data['X_non_spatial'][selected_features]
     
-    # Return results
-    return cv_results
+    # Use selected features directly (no borough dummies)
+    X_combined = X_selected.copy()
+    
+    # Create spatial weight matrix
+    W = create_spatial_weight_matrix(data['X_spatial'])
+    
+    # Run Negative Binomial model on full dataset
+    full_model_results = run_nb_model(X_combined, data['y'], X_combined, data['y'], 
+                                    data['pi'], W)
+    
+    # Report model information criteria
+    if full_model_results is not None:
+        print("\n=== Full Model Results ===")
+        if hasattr(full_model_results, 'lppd'):
+            print(f"LPPD: {full_model_results.lppd:.2f}")
+        if hasattr(full_model_results, 'waic'):
+            print(f"WAIC: {full_model_results.waic:.2f}")
+        
+        # Report coefficients in a clear, formatted table
+        report_model_coefficients(full_model_results, X_combined.columns)
+        
+        # Report spatial parameters
+        if hasattr(full_model_results, 'post_sigma_mess') and full_model_results.post_sigma_mess is not None:
+            print("\nSpatial Parameters:")
+            print(f"sigma_mess (mean): {full_model_results.post_sigma_mess['mean'].values[0]:.4f}")
+        if hasattr(full_model_results, 'post_tau') and full_model_results.post_tau is not None:
+            print(f"tau (mean): {full_model_results.post_tau['mean'].values[0]:.4f}")
+        
+        # Report negative binomial dispersion parameter
+        if hasattr(full_model_results, 'post_r') and full_model_results.post_r is not None:
+            print(f"\nNegative Binomial Dispersion Parameter (r):")
+            print(f"r (mean): {full_model_results.post_r['mean'].values[0]:.4f}")
+        
+        # Generate spatial correlation network from full model results
+        spatial_df = pd.DataFrame({
+            'int_no': data['int_no'].values.flatten(),
+            'x': data['X_spatial']['x'].values.flatten(),
+            'y': data['X_spatial']['y'].values.flatten(),
+            'pred_counts': full_model_results.post_mean_lam.flatten()
+        })
+        
+        print("\nGenerating spatial correlation network from full model results...")
+        plot_spatial_correlation_network(
+            spatial_df,
+            full_model_results,
+            W,
+            "results",
+            correlation_threshold=0.2  # Slightly lower threshold for better visualization
+        )
+    
+    # Run cross-validation for predictive performance evaluation
+    print("\nRunning cross-validation to evaluate predictive performance...")
+    cv_results = run_cross_validation(
+        data['X_non_spatial'], 
+        data['X_spatial'], 
+        data['y'], 
+        data['int_no'], 
+        data['pi'], 
+        None,  # No borough dummies
+        k=5
+    )
+    
+    # Create visualizations from cross-validation results
+    if cv_results and 'combined_results' in cv_results:
+        
+        # Create spatial visualization of CV predictions
+        # Group by int_no and calculate mean predictions
+        cv_pred_by_int = cv_results['combined_results'].groupby('int_no')['pred_counts'].mean()
+        
+        cv_spatial_df = pd.DataFrame({
+            'int_no': data['int_no'].values.flatten(),
+            'x': data['X_spatial']['x'].values.flatten(),
+            'y': data['X_spatial']['y'].values.flatten(),
+            'pred_counts': [cv_pred_by_int.get(int_id, np.nan) for int_id in data['int_no'].values.flatten()],
+            'actual_counts': data['y'].values.flatten()
+        })
+        
+        # Generate heatmap from cross-validation results
+        plot_accident_heatmap(cv_spatial_df, results_path="results")
+        
+        # Generate predicted vs actual plots from cross-validation results
+        plot_predicted_vs_actual(
+            pd.DataFrame({
+                'actual': cv_results['combined_results']['true_counts'],
+                'predicted': cv_results['combined_results']['pred_counts']
+            }),
+            results_path="results"
+        )
+    
+    print("\nProcessing complete. Results saved to 'results' directory.")
+    return full_model_results, cv_results
 
 
 # Run the main script
 if __name__ == "__main__":
-    results = main()
+    full_results, cv_results = main()

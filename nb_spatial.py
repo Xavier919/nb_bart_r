@@ -21,7 +21,6 @@ import torch.optim as optim
 from numba import jit
 import pypolyagamma as pypolyagamma
 import networkx as nx
-from sklearn.linear_model import PoissonRegressor
 
 #####################################
 # Data and Utility Classes
@@ -986,74 +985,58 @@ def load_and_prepare_data():
     }
 
 
-def create_spatial_weight_matrix(X_spatial):
+def create_spatial_weight_matrix(X_spatial, k_neighbors=3):
     """
-    Create a spatial weight matrix based on distances between coordinates.
-    Uses GPU acceleration if available.
+    Create a spatial weight matrix based on k-nearest neighbors.
+    Optimized version with optional GPU acceleration.
+    
+    Args:
+        X_spatial: DataFrame containing x and y coordinates
+        k_neighbors: Number of nearest neighbors to use
+        use_gpu: Whether to use GPU acceleration if available
     """
     # Extract coordinates
     coords = X_spatial[['x', 'y']].values
     print(f"Coordinates shape: {coords.shape}")
+    n = len(coords)
     
-    # Use GPU if available
-    if torch.cuda.is_available():
-        coords_tensor = torch.tensor(coords, device='cuda', dtype=torch.float32)
-        
-        # Calculate pairwise distances on GPU
-        n = len(coords_tensor)
-        distances = torch.zeros((n, n), device='cuda')
-        
-        # More efficient batched calculation to avoid potential OOM errors
-        batch_size = 100  # Adjust based on GPU memory
-        for i in range(0, n, batch_size):
-            end_idx = min(i + batch_size, n)
-            batch_coords = coords_tensor[i:end_idx]
-            
-            # Calculate distances for this batch to all other points
-            diff = batch_coords.unsqueeze(1) - coords_tensor.unsqueeze(0)
-            batch_distances = torch.sqrt((diff ** 2).sum(dim=2))
-            distances[i:end_idx] = batch_distances
-        
-        # Create weight matrix based on distance bands
-        W = torch.zeros((n, n), device='cuda')
-        
-        # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 750)] = 1.0        # Full weight within 0.75km
-        W[(distances > 750) & (distances <= 1500)] = 0.5     # Half weight within 0.75-1.5km
-        W[(distances > 1500) & (distances <= 2250)] = 0.25   # Quarter weight within 1.5-2.25km
-        
-        # Row-normalize the weight matrix
-        row_sums = W.sum(dim=1, keepdim=True)
-        row_sums[row_sums == 0] = 1.0  # Avoid division by zero
-        W = W / row_sums
-        
-        # Convert back to numpy
-        W = W.cpu().numpy()
-    else:
-        # Original CPU implementation
-        distances = squareform(pdist(coords, 'euclidean'))
-        n = len(X_spatial)
-        W = np.zeros((n, n))
-        # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 500)] = 1.0        # Full weight within 0.75km
-        W[(distances > 500) & (distances <= 1000)] = 0.5     # Half weight within 0.75-1.5km
-        W[(distances > 1000) & (distances <= 1500)] = 0.25   # Quarter weight within 1.5-2.25km
-        
-        row_sums = W.sum(axis=1)
-        W[row_sums > 0] = W[row_sums > 0] / row_sums[row_sums > 0].reshape(-1, 1)
+    # Define weights for nearest neighbors (in descending order)
+    weights = [1.0, 0.5, 0.25][:k_neighbors]
     
+    # Use scikit-learn's NearestNeighbors which is optimized for KNN searches
+    from sklearn.neighbors import NearestNeighbors
+    
+    # Initialize weight matrix
+    W = np.zeros((n, n))
+    
+    # Find k+1 nearest neighbors (including self)
+    nbrs = NearestNeighbors(n_neighbors=k_neighbors+1, algorithm='ball_tree').fit(coords)
+    distances, indices = nbrs.kneighbors(coords)
+    
+    # Assign weights to neighbors (excluding self)
+    for i in range(n):
+        # Skip the first neighbor (which is the point itself)
+        for j, neighbor_idx in enumerate(indices[i][1:k_neighbors+1]):
+            W[i, neighbor_idx] = weights[j]
+    
+    # Row-normalize the weight matrix
+    row_sums = W.sum(axis=1)
+    non_zero_rows = row_sums > 0
+    W[non_zero_rows] = W[non_zero_rows] / row_sums[non_zero_rows].reshape(-1, 1)
+    
+    print(f"Created KNN spatial weight matrix with {np.count_nonzero(W)} non-zero elements")
     return W
-
 
 def select_features_with_lasso(X, y, borough_dummies=None):
     """
-    Select features using Lasso regression with Poisson distribution
+    Select features using Lasso regression
     Always keeps specified important features and borough dummies
     """
     # List of features to always keep
     important_features = ['ln_cti', 'ln_cri', 'ln_cli', 'ln_pi', 'ln_fri', 'ln_fli', 'ln_fi', 
                          'ln_cti_squared', 'ln_cri_squared', 'ln_cli_squared', 'ln_pi_squared', 
                          'ln_fri_squared', 'ln_fli_squared', 'ln_fi_squared']
+    
     # Add borough dummy columns to important features if they exist
     if borough_dummies is not None:
         important_features.extend(borough_dummies.columns.tolist())
@@ -1065,78 +1048,18 @@ def select_features_with_lasso(X, y, borough_dummies=None):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    alphas = [0.1, 1, 10, 20, 30]
-    cv_scores = []
+    lasso = LassoCV(cv=5, random_state=42, max_iter=500000, tol=1e-4)
+    lasso.fit(X_scaled, y)
     
-    # Perform manual cross-validation with Poisson regression
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    
-    for alpha in alphas:
-        fold_scores = []
-        for train_idx, val_idx in kf.split(X_scaled):
-            X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
-            # Fit Poisson Lasso
-            poisson_lasso = PoissonRegressor(
-                alpha=alpha,
-                max_iter=1000,
-                tol=1e-4,
-                warm_start=True
-            )
-            
-            # Fit model
-            poisson_lasso.fit(X_train, y_train)
-            
-            # Calculate predictions
-            y_pred = poisson_lasso.predict(X_val)
-            
-            # Ensure predictions are positive and handle zeros safely
-            y_pred = np.maximum(y_pred, 1e-10)
-            
-            # Calculate Poisson deviance safely
-            # For y=0 cases, use lim(y->0) y*log(y/μ) - (y-μ) = -μ
-            mask_zero = y_val == 0
-            mask_nonzero = ~mask_zero
-            
-            deviance = 0
-            # Handle non-zero observations
-            if np.any(mask_nonzero):
-                deviance += np.sum(
-                    y_val[mask_nonzero] * np.log(y_val[mask_nonzero]/y_pred[mask_nonzero]) - 
-                    (y_val[mask_nonzero] - y_pred[mask_nonzero])
-                )
-            # Handle zero observations
-            if np.any(mask_zero):
-                deviance += np.sum(-y_pred[mask_zero])
-            
-            deviance *= 2  # Multiply by 2 to get proper deviance
-            fold_scores.append(deviance)
-            
-        cv_scores.append(np.mean(fold_scores))
-    
-    # Select best alpha
-    best_alpha = alphas[np.argmin(cv_scores)]
-    
-    # Fit final model with best alpha
-    final_model = PoissonRegressor(
-        alpha=best_alpha,
-        max_iter=1000,
-        tol=1e-4
-    )
-    final_model.fit(X_scaled, y)
-    
-    # Get features selected by Poisson Lasso
-    lasso_selected = X.columns[np.abs(final_model.coef_) > 1e-5].tolist()
+    # Get features selected by Lasso
+    lasso_selected = X.columns[lasso.coef_ != 0].tolist()
     
     # Combine Lasso-selected features with important features (avoiding duplicates)
     selected_features = list(set(lasso_selected + important_features))
     
-    print(f"\nFeature selection results:")
-    print(f"Best alpha: {best_alpha:.6f}")
     print(f"Selected {len(selected_features)} features:")
     print(f"  - Always included: {important_features}")
-    print(f"  - Poisson Lasso selected: {[f for f in lasso_selected if f not in important_features]}")
+    print(f"  - Lasso selected: {[f for f in lasso_selected if f not in important_features]}")
     
     return selected_features
 
@@ -1158,7 +1081,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     # Define model options - reduced settings for faster computation
     options = Options(
         model_name='fixed_random',
-        nChain=1, nBurn=200, nSample=200, nThin=2, 
+        nChain=1, nBurn=300, nSample=300, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
     )
