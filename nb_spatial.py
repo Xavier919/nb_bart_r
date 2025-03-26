@@ -21,6 +21,7 @@ import torch.optim as optim
 from numba import jit
 import pypolyagamma as pypolyagamma
 import networkx as nx
+from sklearn.linear_model import PoissonRegressor
 
 #####################################
 # Data and Utility Classes
@@ -1017,9 +1018,9 @@ def create_spatial_weight_matrix(X_spatial):
         W = torch.zeros((n, n), device='cuda')
         
         # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 250)] = 1.0
-        W[(distances > 250) & (distances <= 500)] = 0.5
-        W[(distances > 500) & (distances <= 1000)] = 0.25
+        W[(distances > 0) & (distances <= 3000)] = 1.0       # Full weight within 3km (10% of extent)
+        W[(distances > 3000) & (distances <= 6000)] = 0.5    # Half weight within 3-6km
+        W[(distances > 6000) & (distances <= 9000)] = 0.25   # Quarter weight within 6-9km
         
         # Row-normalize the weight matrix
         row_sums = W.sum(dim=1, keepdim=True)
@@ -1034,9 +1035,9 @@ def create_spatial_weight_matrix(X_spatial):
         n = len(X_spatial)
         W = np.zeros((n, n))
         # Define weights based on adjacency orders
-        W[(distances > 0) & (distances <= 250)] = 1.0
-        W[(distances > 250) & (distances <= 500)] = 0.5
-        W[(distances > 500) & (distances <= 1000)] = 0.25
+        W[(distances > 0) & (distances <= 3000)] = 1.0       # Full weight within 3km (10% of extent)
+        W[(distances > 3000) & (distances <= 6000)] = 0.5    # Half weight within 3-6km
+        W[(distances > 6000) & (distances <= 9000)] = 0.25   # Quarter weight within 6-9km
         
         row_sums = W.sum(axis=1)
         W[row_sums > 0] = W[row_sums > 0] / row_sums[row_sums > 0].reshape(-1, 1)
@@ -1046,7 +1047,7 @@ def create_spatial_weight_matrix(X_spatial):
 
 def select_features_with_lasso(X, y, borough_dummies=None):
     """
-    Select features using Lasso regression
+    Select features using Lasso regression with Poisson distribution
     Always keeps specified important features and borough dummies
     """
     # List of features to always keep
@@ -1064,18 +1065,78 @@ def select_features_with_lasso(X, y, borough_dummies=None):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    lasso = LassoCV(cv=5, random_state=42, max_iter=500000, tol=1e-4)
-    lasso.fit(X_scaled, y)
+    alphas = [0.1, 1, 10, 20, 30]
+    cv_scores = []
     
-    # Get features selected by Lasso
-    lasso_selected = X.columns[lasso.coef_ != 0].tolist()
+    # Perform manual cross-validation with Poisson regression
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    
+    for alpha in alphas:
+        fold_scores = []
+        for train_idx, val_idx in kf.split(X_scaled):
+            X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            
+            # Fit Poisson Lasso
+            poisson_lasso = PoissonRegressor(
+                alpha=alpha,
+                max_iter=1000,
+                tol=1e-4,
+                warm_start=True
+            )
+            
+            # Fit model
+            poisson_lasso.fit(X_train, y_train)
+            
+            # Calculate predictions
+            y_pred = poisson_lasso.predict(X_val)
+            
+            # Ensure predictions are positive and handle zeros safely
+            y_pred = np.maximum(y_pred, 1e-10)
+            
+            # Calculate Poisson deviance safely
+            # For y=0 cases, use lim(y->0) y*log(y/μ) - (y-μ) = -μ
+            mask_zero = y_val == 0
+            mask_nonzero = ~mask_zero
+            
+            deviance = 0
+            # Handle non-zero observations
+            if np.any(mask_nonzero):
+                deviance += np.sum(
+                    y_val[mask_nonzero] * np.log(y_val[mask_nonzero]/y_pred[mask_nonzero]) - 
+                    (y_val[mask_nonzero] - y_pred[mask_nonzero])
+                )
+            # Handle zero observations
+            if np.any(mask_zero):
+                deviance += np.sum(-y_pred[mask_zero])
+            
+            deviance *= 2  # Multiply by 2 to get proper deviance
+            fold_scores.append(deviance)
+            
+        cv_scores.append(np.mean(fold_scores))
+    
+    # Select best alpha
+    best_alpha = alphas[np.argmin(cv_scores)]
+    
+    # Fit final model with best alpha
+    final_model = PoissonRegressor(
+        alpha=best_alpha,
+        max_iter=1000,
+        tol=1e-4
+    )
+    final_model.fit(X_scaled, y)
+    
+    # Get features selected by Poisson Lasso
+    lasso_selected = X.columns[np.abs(final_model.coef_) > 1e-5].tolist()
     
     # Combine Lasso-selected features with important features (avoiding duplicates)
     selected_features = list(set(lasso_selected + important_features))
     
+    print(f"\nFeature selection results:")
+    print(f"Best alpha: {best_alpha:.6f}")
     print(f"Selected {len(selected_features)} features:")
     print(f"  - Always included: {important_features}")
-    print(f"  - Lasso selected: {[f for f in lasso_selected if f not in important_features]}")
+    print(f"  - Poisson Lasso selected: {[f for f in lasso_selected if f not in important_features]}")
     
     return selected_features
 
@@ -1457,7 +1518,7 @@ def plot_spatial_correlation_network(spatial_results, results, W, results_path, 
         nx.draw_networkx_nodes(G, pos, 
                               node_size=10,
                               node_color='lightgray',
-                              alpha=0.3,
+                              alpha=0.5,
                               ax=ax)
         
         # Draw edges with color based on correlation strength
@@ -1476,8 +1537,15 @@ def plot_spatial_correlation_network(spatial_results, results, W, results_path, 
         sm.set_array([])
         plt.colorbar(sm, ax=ax, label='Estimated Spatial Correlation (absolute value)')
         
+        # Turn axes on and add labels
+        plt.axis('on')
+        plt.xlabel('X Coordinate')
+        plt.ylabel('Y Coordinate')
+        
+        # Add grid for better readability
+        plt.grid(True, alpha=0.3, linestyle='--')
+        
         plt.title(f'Estimated Spatial Correlation Network (tau={tau:.3f}, sigma={sigma_mess:.3f})')
-        plt.axis('off')
         plt.tight_layout()
         plt.savefig(os.path.join(results_path, 'estimated_correlation_network.png'), dpi=300)
         
