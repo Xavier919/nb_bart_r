@@ -1098,7 +1098,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     # Define model options - reduced settings for faster computation
     options = Options(
         model_name='fixed_random',
-        nChain=2, nBurn=1000, nSample=1000, nThin=2, 
+        nChain=1, nBurn=200, nSample=200, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
     )
@@ -1573,6 +1573,182 @@ def report_model_coefficients(results, X_columns, results_path="results"):
     print(f"Coefficient plot saved to {os.path.join(results_path, 'coefficient_plot.png')}")
 
 
+def plot_accident_heatmap(spatial_results, results_path="results"):
+    """
+    Create a heatmap visualization of predicted accidents using x-y coordinates.
+    
+    Args:
+        spatial_results: DataFrame containing x, y coordinates and predicted accident counts
+        results_path: Path to save the visualization
+    """
+    try:
+        print("Creating accident prediction heatmap...")
+        
+        # Create figure
+        plt.figure(figsize=(14, 12))
+        
+        # Create scatter plot with points colored by predicted accident count
+        scatter = plt.scatter(
+            spatial_results['x'], 
+            spatial_results['y'],
+            c=spatial_results['pred_counts'],
+            cmap='YlOrRd',
+            alpha=0.7,
+            s=30,  # Point size
+            edgecolors='black',
+            linewidths=0.5
+        )
+        
+        # Add colorbar
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Predicted Accident Count')
+        
+        # Add title and labels
+        plt.title('Spatial Distribution of Predicted Accidents')
+        plt.xlabel('X Coordinate')
+        plt.ylabel('Y Coordinate')
+        
+        # Add grid for reference
+        plt.grid(alpha=0.3)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'accident_prediction_heatmap.png'), dpi=300)
+        print(f"Accident prediction heatmap saved to {os.path.join(results_path, 'accident_prediction_heatmap.png')}")
+        
+        # Create a second visualization with hexbin for density
+        plt.figure(figsize=(14, 12))
+        hexbin = plt.hexbin(
+            spatial_results['x'], 
+            spatial_results['y'],
+            C=spatial_results['pred_counts'],
+            gridsize=50,
+            cmap='YlOrRd',
+            mincnt=1
+        )
+        plt.colorbar(hexbin, label='Mean Predicted Accidents')
+        plt.title('Density Heatmap of Predicted Accidents')
+        plt.xlabel('X Coordinate')
+        plt.ylabel('Y Coordinate')
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'accident_prediction_density.png'), dpi=300)
+        print(f"Accident prediction density map saved to {os.path.join(results_path, 'accident_prediction_density.png')}")
+        
+    except Exception as e:
+        print(f"Error creating accident heatmap: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def plot_predicted_vs_actual(results, results_path="results"):
+    """
+    Create scatter plots comparing predicted vs actual accident counts.
+    
+    Args:
+        results: DataFrame containing actual and predicted accident counts
+        results_path: Path to save the visualization
+    """
+    try:
+        print("Creating predicted vs actual comparison plots...")
+        os.makedirs(results_path, exist_ok=True)
+        
+        # Extract data
+        if isinstance(results, pd.DataFrame):
+            # If results is already a DataFrame with the right columns
+            df = results
+        elif hasattr(results, 'test_predictions') and hasattr(results, 'test_actual'):
+            # If results is a model Results object
+            df = pd.DataFrame({
+                'actual': results.test_actual,
+                'predicted': results.test_predictions
+            })
+        else:
+            # For full model results
+            df = pd.DataFrame({
+                'actual': results.data.y,
+                'predicted': results.post_mean_lam
+            })
+        
+        # Create scatter plot
+        plt.figure(figsize=(10, 8))
+        plt.scatter(df['actual'], df['predicted'], alpha=0.6, edgecolors='k', linewidths=0.5)
+        
+        # Add perfect prediction line
+        max_val = max(df['actual'].max(), df['predicted'].max()) * 1.1
+        plt.plot([0, max_val], [0, max_val], 'r--', label='Perfect prediction')
+        
+        # Add regression line
+        from scipy import stats
+        slope, intercept, r_value, p_value, std_err = stats.linregress(df['actual'], df['predicted'])
+        plt.plot(
+            [0, max_val], 
+            [intercept, intercept + slope * max_val], 
+            'b-', 
+            label=f'Regression line (R² = {r_value**2:.3f})'
+        )
+        
+        # Add labels and title
+        plt.xlabel('Actual Accident Count')
+        plt.ylabel('Predicted Accident Count')
+        plt.title('Predicted vs Actual Accident Counts')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        # Set equal aspect ratio
+        plt.axis('equal')
+        plt.xlim(0, max_val)
+        plt.ylim(0, max_val)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'predicted_vs_actual.png'), dpi=300)
+        
+        # Create residual plot
+        plt.figure(figsize=(10, 8))
+        residuals = df['predicted'] - df['actual']
+        plt.scatter(df['actual'], residuals, alpha=0.6, edgecolors='k', linewidths=0.5)
+        plt.axhline(y=0, color='r', linestyle='--')
+        
+        # Add labels and title
+        plt.xlabel('Actual Accident Count')
+        plt.ylabel('Residual (Predicted - Actual)')
+        plt.title('Residual Plot')
+        plt.grid(alpha=0.3)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'residual_plot.png'), dpi=300)
+        
+        # Create histogram of residuals
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals, bins=30, alpha=0.7, edgecolor='black')
+        plt.axvline(x=0, color='r', linestyle='--')
+        plt.xlabel('Residual (Predicted - Actual)')
+        plt.ylabel('Frequency')
+        plt.title('Histogram of Residuals')
+        plt.grid(alpha=0.3)
+        
+        # Save figure
+        plt.tight_layout()
+        plt.savefig(os.path.join(results_path, 'residual_histogram.png'), dpi=300)
+        
+        print(f"Predicted vs actual plots saved to {results_path}")
+        
+        # Return some statistics
+        return {
+            'r_squared': r_value**2,
+            'mean_residual': residuals.mean(),
+            'residual_std': residuals.std()
+        }
+        
+    except Exception as e:
+        print(f"Error creating predicted vs actual plots: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def main():
     """Main function to run the entire workflow"""
     # Create results directory if it doesn't exist
@@ -1636,6 +1812,30 @@ def main():
         data.get('borough_dummies'), 
         k=5
     )
+    
+    # Create visualizations from cross-validation results
+    if cv_results and 'combined_results' in cv_results:
+        
+        # Create spatial visualization of CV predictions
+        cv_spatial_df = pd.DataFrame({
+            'int_no': data['int_no'],
+            'x': data['X_spatial']['x'],
+            'y': data['X_spatial']['y'],
+            'pred_counts': cv_results['combined_results'].groupby('int_no')['pred_counts'].mean(),
+            'actual_counts': data['y']
+        })
+        
+        # Generate heatmap from cross-validation results
+        plot_accident_heatmap(cv_spatial_df, results_path="results/cv_results")
+        
+        # Generate predicted vs actual plots from cross-validation results
+        plot_predicted_vs_actual(
+            pd.DataFrame({
+                'actual': cv_results['combined_results']['true_counts'],
+                'predicted': cv_results['combined_results']['pred_counts']
+            }),
+            results_path="results"
+        )
     
     print("\nProcessing complete. Results saved to 'results' directory.")
     return full_model_results, cv_results
