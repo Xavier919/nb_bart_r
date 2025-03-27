@@ -362,7 +362,7 @@ def run_cross_validation(data, formula, k=5, random_effect=None, exposure=None):
     for i, (train_idx, test_idx) in enumerate(kf.split(data), 1):
         print(f"\n========== Fold {i}/{k} ==========")
         
-        # Split data into train and test
+        # Split data into train and testf
         train_data = data.iloc[train_idx].copy()
         test_data = data.iloc[test_idx].copy()
         
@@ -390,20 +390,24 @@ def run_cross_validation(data, formula, k=5, random_effect=None, exposure=None):
         
         # Calculate metrics
         train_mae = mean_absolute_error(train_data['acc'], train_preds)
-        train_rmse = np.sqrt(mean_squared_error(train_data['acc'], train_preds))
+        train_mse = mean_squared_error(train_data['acc'], train_preds)
+        train_rmse = np.sqrt(train_mse)
         
         test_mae = mean_absolute_error(test_data['acc'], test_preds)
-        test_rmse = np.sqrt(mean_squared_error(test_data['acc'], test_preds))
+        test_mse = mean_squared_error(test_data['acc'], test_preds)
+        test_rmse = np.sqrt(test_mse)
         
-        print(f"Train MAE: {train_mae:.4f}, RMSE: {train_rmse:.4f}")
-        print(f"Test MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")
+        print(f"Train MAE: {train_mae:.4f}, MSE: {train_mse:.4f}, RMSE: {train_rmse:.4f}")
+        print(f"Test MAE: {test_mae:.4f}, MSE: {test_mse:.4f}, RMSE: {test_rmse:.4f}")
         
         # Store results
         fold_results.append({
             'fold': i,
             'train_mae': train_mae,
+            'train_mse': train_mse,
             'train_rmse': train_rmse,
             'test_mae': test_mae,
+            'test_mse': test_mse,
             'test_rmse': test_rmse,
             'model': model
         })
@@ -414,15 +418,18 @@ def run_cross_validation(data, formula, k=5, random_effect=None, exposure=None):
     
     # Calculate overall CV metrics
     overall_mae = mean_absolute_error(test_actual, test_predicted)
-    overall_rmse = np.sqrt(mean_squared_error(test_actual, test_predicted))
+    overall_mse = mean_squared_error(test_actual, test_predicted)
+    overall_rmse = np.sqrt(overall_mse)
     
     print(f"\n========== Overall CV Results ==========")
     print(f"Overall MAE: {overall_mae:.4f}")
+    print(f"Overall MSE: {overall_mse:.4f}")
     print(f"Overall RMSE: {overall_rmse:.4f}")
     
     return {
         'fold_results': fold_results,
         'overall_mae': overall_mae,
+        'overall_mse': overall_mse,
         'overall_rmse': overall_rmse,
         'test_actual': test_actual,
         'test_predicted': test_predicted
