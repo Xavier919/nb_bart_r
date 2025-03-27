@@ -609,6 +609,93 @@ def plot_accident_heatmap(data, results_path="results"):
     plt.close()
 
 
+def plot_model_coefficients(model_results, results_path="results"):
+    """
+    Create a clear, formatted table of model coefficients and save to CSV.
+    Also creates a coefficient plot with confidence intervals.
+    
+    Args:
+        model_results: Model results object from statsmodels
+        results_path: Path to save results
+    """
+    if model_results is None:
+        print("No model results available")
+        return
+    
+    # Create coefficient table
+    coef_df = pd.DataFrame({
+        'Estimate': model_results.params,
+        'Std. Error': model_results.bse,
+        'Lower 95% CI': model_results.conf_int()[0],
+        'Upper 95% CI': model_results.conf_int()[1],
+        'P-Value': model_results.pvalues
+    })
+    
+    # Add a column for significance
+    coef_df['Significant'] = coef_df['P-Value'] < 0.05
+    
+    # Remove intercept for plotting
+    if 'Intercept' in coef_df.index:
+        plot_df = coef_df.drop('Intercept')
+    else:
+        plot_df = coef_df.copy()
+    
+    # Sort by absolute effect size
+    plot_df = plot_df.sort_values(by='Estimate', key=abs, ascending=False)
+    
+    # Print nicely formatted table to console
+    pd.set_option('display.max_rows', None)  # Show all rows
+    pd.set_option('display.width', 120)      # Wider display
+    pd.set_option('display.precision', 4)    # Show 4 decimal places
+    
+    print("\n=== Model Coefficients ===")
+    print(coef_df[['Estimate', 'Std. Error', 'Lower 95% CI', 'Upper 95% CI', 'Significant']])
+    
+    # Save to CSV
+    os.makedirs(results_path, exist_ok=True)
+    coef_df.to_csv(os.path.join(results_path, "model_coefficients.csv"))
+    print(f"Coefficient table saved to {os.path.join(results_path, 'model_coefficients.csv')}")
+    
+    # Create coefficient plot
+    plt.figure(figsize=(12, max(8, len(plot_df) * 0.3)))
+    
+    # Plot coefficients and confidence intervals
+    y_pos = np.arange(len(plot_df))
+    
+    # Plot each point separately with appropriate color based on significance
+    for i, (idx, row) in enumerate(plot_df.iterrows()):
+        color = 'darkred' if row['Significant'] else 'darkblue'
+        plt.errorbar(
+            x=row['Estimate'],
+            y=i,
+            xerr=[[row['Estimate'] - row['Lower 95% CI']], 
+                  [row['Upper 95% CI'] - row['Estimate']]],
+            fmt='o',
+            capsize=5,
+            color=color,
+            alpha=0.7
+        )
+    
+    # Add vertical line at zero
+    plt.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+    
+    # Add labels and title
+    plt.yticks(y_pos, plot_df.index)
+    plt.xlabel('Coefficient Estimate')
+    plt.title('Model Coefficients with 95% Confidence Intervals')
+    plt.grid(axis='x', alpha=0.3)
+    
+    # Add legend
+    plt.plot([], [], 'o', color='darkred', label='Significant (p<0.05)')
+    plt.plot([], [], 'o', color='darkblue', label='Not significant')
+    plt.legend(loc='best')
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_path, "coefficient_plot.png"), dpi=300)
+    print(f"Coefficient plot saved to {os.path.join(results_path, 'coefficient_plot.png')}")
+
+
 #####################################
 # Main Function
 #####################################
@@ -627,7 +714,7 @@ def main():
     X = data[feature_cols]
     y = data['acc']
     
-    selected_features = select_features_with_lasso(X, y, max_features=15)
+    selected_features = select_features_with_lasso(X, y, max_features=40)
     
     # Create spatial weights matrix
     print("\nCreating spatial weights matrix...")
@@ -661,6 +748,9 @@ def main():
     
     # Print model summary
     model.summary()
+    
+    # Plot model coefficients
+    plot_model_coefficients(model.results, results_path="results")
     
     # Create spatial correlation visualization
     plot_spatial_correlation(data, W)
