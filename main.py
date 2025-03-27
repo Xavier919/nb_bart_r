@@ -186,8 +186,8 @@ def select_features_with_lasso(X, y, max_features=20):
 
 class SpatialMixedNegativeBinomial:
     """
-    A simplified spatial mixed-effects negative binomial model.
-    Uses statsmodels for estimation and handles spatial correlation.
+    A spatial mixed-effects negative binomial model.
+    Uses a two-stage approach combining statsmodels GLM with random effects.
     """
     
     def __init__(self, data=None, formula=None, random_effect=None, exposure=None, spatial_vars=None):
@@ -209,6 +209,8 @@ class SpatialMixedNegativeBinomial:
         self.model = None
         self.results = None
         self.W = None
+        self.random_effects = None
+        self.random_effects_variance = None
         
     def add_spatial_lags(self, data, variables, W=None):
         """
@@ -238,7 +240,7 @@ class SpatialMixedNegativeBinomial:
     
     def fit(self, add_spatial_lags_for=None):
         """
-        Fit the model to the data.
+        Fit the model to the data using a two-stage approach for mixed effects.
         
         Args:
             add_spatial_lags_for: List of variables to create spatial lags for before fitting
@@ -255,14 +257,68 @@ class SpatialMixedNegativeBinomial:
         # No offset term - we're modeling counts directly
         full_formula = self.formula
         
-        # Fit the model - we'll use a two-stage approach for mixed effects
-        # First, fit a regular negative binomial model
-        print(f"Fitting model with formula: {full_formula}")
+        # Step 1: Estimate random effects using MixedLM
+        if self.random_effect:
+            print(f"Estimating random effects for {self.random_effect}...")
+            
+            # Extract fixed effects part of the formula (remove response variable)
+            fixed_effects_formula = full_formula.split('~')[1].strip()
+            
+            # Create design matrices for fixed and random effects
+            import patsy
+            y, X = patsy.dmatrices(full_formula, data_to_use, return_type='dataframe')
+            
+            # Create groups for random effects
+            groups = data_to_use[self.random_effect]
+            
+            # Fit mixed linear model to estimate random effects
+            # We use log(acc + 1) as response for the random effects estimation
+            data_to_use['log_acc'] = np.log1p(data_to_use['acc'])
+            re_formula = f"log_acc ~ {fixed_effects_formula}"
+            y_re, X_re = patsy.dmatrices(re_formula, data_to_use, return_type='dataframe')
+            
+            # Create exog_re matrix for random effects (intercept only)
+            exog_re = np.ones((len(data_to_use), 1))
+            
+            mixed_model = sm.MixedLM(
+                endog=y_re,
+                exog=X_re,
+                groups=groups,
+                exog_re=exog_re  # Use exog_re instead of re_formula
+            )
+            
+            mixed_results = mixed_model.fit()
+            print("Random effects model summary:")
+            print(mixed_results.summary())
+            
+            # Extract random effects
+            self.random_effects = mixed_results.random_effects
+            self.random_effects_variance = mixed_results.cov_re.iloc[0, 0]
+            
+            # Create random effect adjustment for the negative binomial model
+            data_to_use['random_effect_adj'] = 0.0
+            
+            for group in self.random_effects:
+                mask = data_to_use[self.random_effect] == group
+                data_to_use.loc[mask, 'random_effect_adj'] = self.random_effects[group].iloc[0]
+            
+            # Remove the random effect term from the formula for the NB model
+            # since we're now accounting for it via the adjustment
+            import re
+            pattern = r'\+\s*C\(' + self.random_effect + r'\)'
+            full_formula = re.sub(pattern, '', full_formula)
+            
+            # Instead of using offset, we'll adjust the response variable
+            # We'll create an adjusted count based on the random effects
+            data_to_use['adj_acc'] = data_to_use['acc'] * np.exp(-data_to_use['random_effect_adj'])
+            
+            # Update formula to use adjusted response
+            full_formula = full_formula.replace('acc ~', 'adj_acc ~')
+            
+            print(f"Adjusted formula with random effects: {full_formula}")
         
-        # If we have a random effect, add it as a categorical variable
-        if self.random_effect and self.random_effect not in full_formula:
-            full_formula += f" + C({self.random_effect})"
-            print(f"Added random effect as categorical: {full_formula}")
+        # Step 2: Fit negative binomial model with random effects adjustment
+        print(f"Fitting negative binomial model with formula: {full_formula}")
         
         nb_model = smf.glm(
             formula=full_formula,
@@ -273,15 +329,14 @@ class SpatialMixedNegativeBinomial:
         self.model = nb_model
         self.results = nb_model.fit()
         
-        # For random effects, we'll just note that they're included as fixed effects
-        if self.random_effect:
-            print(f"Included {self.random_effect} as fixed effect (categorical variable)")
+        # Store the data with random effect adjustments for prediction
+        self.data_with_re = data_to_use
         
         return self.results
     
     def predict(self, newdata=None, add_spatial_lags=True):
         """
-        Make predictions from the fitted model.
+        Make predictions from the fitted model, accounting for random effects.
         
         Args:
             newdata: New data for prediction (if None, uses training data)
@@ -294,7 +349,26 @@ class SpatialMixedNegativeBinomial:
             raise ValueError("Model must be fitted before prediction")
         
         if newdata is None:
-            newdata = self.data.copy()
+            # Use the data with random effects already computed
+            if hasattr(self, 'data_with_re'):
+                newdata = self.data_with_re.copy()
+            else:
+                newdata = self.data.copy()
+        else:
+            # For new data, we need to add random effects
+            newdata = newdata.copy()
+            if self.random_effect and hasattr(self, 'random_effects'):
+                newdata['random_effect_adj'] = 0.0
+                
+                # Apply random effects from training data to matching groups in new data
+                for group in self.random_effects:
+                    mask = newdata[self.random_effect] == group
+                    if mask.any():
+                        newdata.loc[mask, 'random_effect_adj'] = self.random_effects[group].iloc[0]
+                    else:
+                        # For groups not seen in training, use 0 (no random effect)
+                        # Alternative: could use average of random effects or draw from distribution
+                        pass
         
         # Add spatial lags if the model used them
         if add_spatial_lags and 'sp_lag_' in str(self.formula):
@@ -303,18 +377,37 @@ class SpatialMixedNegativeBinomial:
             sp_lag_vars = re.findall(r'sp_lag_(\w+)', self.formula)
             newdata = self.add_spatial_lags(newdata, sp_lag_vars, self.W)
         
-        # Predict counts directly - no need to adjust for exposure
-        predictions = self.results.predict(newdata)
+        # Predict counts and adjust for random effects
+        if 'adj_acc' in str(self.formula):
+            # If we used adjusted counts, we need to reverse the adjustment
+            raw_predictions = self.results.predict(newdata)
+            predictions = raw_predictions * np.exp(newdata['random_effect_adj'])
+        else:
+            predictions = self.results.predict(newdata)
         
         return predictions
     
     def summary(self):
-        """Print model summary"""
+        """Print model summary including random effects information"""
         if self.results is None:
             print("Model has not been fitted yet")
             return
         
         print(self.results.summary())
+        
+        # Print random effects information if available
+        if hasattr(self, 'random_effects') and self.random_effects is not None:
+            print("\nRandom Effects Summary:")
+            print(f"Random Effects Variance: {self.random_effects_variance:.4f}")
+            
+            # Create a DataFrame of random effects for better display
+            re_df = pd.DataFrame({
+                'Group': list(self.random_effects.keys()),
+                'Random Effect': [self.random_effects[g].iloc[0] for g in self.random_effects]
+            })
+            re_df = re_df.sort_values('Random Effect', ascending=False)
+            print("\nRandom Effects by Group:")
+            print(re_df)
         
         # Print performance metrics
         y_true = self.data['acc']
