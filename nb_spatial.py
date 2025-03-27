@@ -495,7 +495,7 @@ class NegativeBinomial:
         
         if self.mess:
             sigma2 = np.sqrt(0.4)
-            tau = -float(0.5 + np.random.rand())
+            tau = float(10 + np.random.rand())  # Positive initialization between 0.5 and 1.5
             S = expm(tau * self.data.W)
             Omega_tilde = S.T @ S / sigma2         
             eps = np.sqrt(sigma2) * np.random.randn(self.data.N,)
@@ -985,7 +985,7 @@ def load_and_prepare_data():
     }
 
 
-def create_spatial_weight_matrix(X_spatial, k_neighbors=3):
+def create_spatial_weight_matrix(X_spatial, k_neighbors=9):
     """
     Create a spatial weight matrix based on k-nearest neighbors.
     Optimized version with optional GPU acceleration.
@@ -1001,7 +1001,7 @@ def create_spatial_weight_matrix(X_spatial, k_neighbors=3):
     n = len(coords)
     
     # Define weights for nearest neighbors (in descending order)
-    weights = [1.0, 0.5, 0.25][:k_neighbors]
+    weights = [1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25][:k_neighbors]
     
     # Use scikit-learn's NearestNeighbors which is optimized for KNN searches
     from sklearn.neighbors import NearestNeighbors
@@ -1081,7 +1081,7 @@ def run_nb_model(X_train, y_train, X_test, y_test, pi_train, W_train):
     # Define model options - reduced settings for faster computation
     options = Options(
         model_name='fixed_random',
-        nChain=1, nBurn=300, nSample=300, nThin=2, 
+        nChain=1, nBurn=1000, nSample=1000, nThin=2, 
         mh_step_initial=0.1, mh_target=0.3, mh_correct=0.01, mh_window=50,
         disp=100, delete_draws=False, seed=42
     )
