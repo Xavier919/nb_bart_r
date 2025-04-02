@@ -1,11 +1,10 @@
-# Load packages without suppressing any messages
-cat("Loading packages...\n")
+# Install CARBayes package first
+library(spdep)
 library(dplyr)
 library(ggplot2)
 library(Matrix)
 library(FNN)
 library(caret)
-library(spdep)
 library(glmnet)
 library(R6)
 library(CARBayes)
@@ -15,6 +14,7 @@ library(conflicted)
 # Resolve the select conflict explicitly
 conflict_prefer("select", "dplyr")
 cat("Using dplyr::select:", identical(select, dplyr::select), "\n")
+
 
 #####################################
 # Data Processing Functions
@@ -125,7 +125,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 10) {
+create_spatial_weights <- function(data, k_neighbors = 5) {
   # Create spatial weights based on k-nearest neighbors
   # Returns a symmetric spatial weights matrix (required for CARBayes)
   
@@ -311,17 +311,16 @@ SpatialMixedNegativeBinomial <- R6::R6Class(
       
       cat("Fitting CARBayes model with formula:", deparse(full_formula), "\n")
       
-      # Fit the CARBayes model - S.CARleroux handles both CAR and BYM models
-      # Reduce MCMC complexity to avoid stack issues
+
       model <- S.CARleroux(
         formula = full_formula,
-        family = "poisson",  # Using Poisson instead of negative binomial
+        family = "poisson",  
         data = data_to_use,
         W = self$W,
-        burnin = 500,      # Reduced MCMC settings to avoid stack issues
-        n.sample = 1000,    # Reduced from 15000
-        thin = 2,           # Reduced from 10
-        rho = 0.8,          # Starting value for spatial correlation parameter
+        burnin = 2000,      
+        n.sample = 5000,    
+        thin = 2,           
+        rho = 0.8,          
         verbose = TRUE
       )
       
