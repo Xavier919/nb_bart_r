@@ -125,7 +125,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 5) {
+create_spatial_weights <- function(data, k_neighbors = 3) {
   # Create spatial weights based on k-nearest neighbors
   # Returns a symmetric spatial weights matrix (required for CARBayes)
   
@@ -320,7 +320,7 @@ SpatialMixedNegativeBinomial <- R6::R6Class(
         burnin = 2000,      
         n.sample = 5000,    
         thin = 2,           
-        rho = 0.8,          
+        rho = 0.5,          
         verbose = TRUE
       )
       
