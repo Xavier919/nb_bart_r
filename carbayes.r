@@ -161,11 +161,6 @@ create_spatial_weights <- function(data, k_neighbors = 3) {
   return(W_symmetric)
 }
 
-calculate_spatial_lag <- function(data, variable, W) {
-  # Calculate the spatial lag of a variable using weights matrix W
-  return(W %*% data[[variable]])
-}
-
 select_features_with_lasso <- function(X, y, max_features = 30) {
   # Select most important features using Lasso regression
   
