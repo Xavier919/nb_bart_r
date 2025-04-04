@@ -116,8 +116,8 @@ select_features_with_lasso <- function(X, y, max_features = 30) {
   return(names(selected_features))
 }
 
-SpatialMixedNegativeBinomial <- R6::R6Class(
-  "SpatialMixedNegativeBinomial",
+carbayes_model <- R6::R6Class(
+  "carbayes_model",
   
   public = list(
     data = NULL,
@@ -315,7 +315,7 @@ run_cross_validation <- function(data, response_var = "acc", k = 5, random_effec
     
     formula <- paste(response_var, "~", paste(selected_features, collapse = " + "))
     
-    model <- SpatialMixedNegativeBinomial$new(
+    model <- carbayes_model$new(
       data = train_data,
       formula = formula,
       random_effect = random_effect,
