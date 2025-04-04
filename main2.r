@@ -127,67 +127,161 @@ select_features_with_lasso <- function(X, y, max_features = 30) {
   return(names(selected_features))
 }
 
-# Implementing CARleroux model
-fit_car_leroux_model <- function(data, formula, W, burnin = 500, n.sample = 1000, thin = 2) {
-  # Convert the weight matrix to the format required by CARBayes
-  W_binary <- W
-  W_binary[W_binary > 0] <- 1
+# First, we'll add the R6 class definition for carbayes_model (similar to main.r)
+carbayes_model <- R6::R6Class(
+  "carbayes_model",
   
-  # Fit the model using S.CARleroux from CARBayes
-  model <- S.CARleroux(
-    formula = formula,
-    data = data,
-    family = "poisson",
-    W = W_binary,
-    burnin = burnin,
-    n.sample = n.sample,
-    thin = thin,
-    verbose = TRUE
+  public = list(
+    data = NULL,
+    formula = NULL,
+    random_effect = NULL,
+    exposure = NULL,
+    spatial_vars = NULL,
+    model = NULL,
+    results = NULL,
+    W = NULL,
+    W_list = NULL,
+    data_with_re = NULL,
+    
+    initialize = function(data = NULL, formula = NULL, random_effect = NULL, 
+                         exposure = NULL, spatial_vars = NULL) {
+      self$data <- data
+      self$formula <- formula
+      self$random_effect <- random_effect
+      self$exposure <- exposure
+      self$spatial_vars <- spatial_vars
+    },
+    
+    fit = function() {
+      data_to_use <- self$data
+      
+      if (is.null(self$W)) {
+        self$W <- create_spatial_weights(data_to_use[, self$spatial_vars])
+      }
+      
+      self$W_list <- self$create_W_list(self$W)
+      
+      formula_parts <- strsplit(self$formula, "~")[[1]]
+      response_var <- trimws(formula_parts[1])
+      predictors <- trimws(formula_parts[2])
+      
+      if (!is.null(self$random_effect) && self$random_effect %in% colnames(data_to_use)) {
+        if (!is.factor(data_to_use[[self$random_effect]])) {
+          data_to_use[[self$random_effect]] <- as.factor(data_to_use[[self$random_effect]])
+        }
+        predictors <- paste(predictors, "+", self$random_effect)
+      }
+      
+      full_formula <- as.formula(paste(response_var, "~", predictors))
+      
+      model <- S.CARleroux(
+        formula = full_formula,
+        family = "poisson",  
+        data = data_to_use,
+        W = self$W,
+        burnin = 2000,
+        n.sample = 5000,
+        thin = 2,
+        rho = 0.8,
+        verbose = TRUE
+      )
+      
+      self$model <- model
+      self$results <- model
+      self$data_with_re <- data_to_use
+      
+      return(self$results)
+    },
+    
+    predict = function(newdata = NULL) {
+      if (is.null(self$results)) {
+        stop("Model must be fitted before prediction")
+      }
+      
+      if (is.null(newdata)) {
+        if (!is.null(self$data_with_re)) {
+          newdata <- self$data_with_re
+        } else {
+          newdata <- self$data
+        }
+      }
+      
+      formula_parts <- strsplit(self$formula, "~")[[1]]
+      predictors <- trimws(formula_parts[2])
+      
+      if (!is.null(self$random_effect) && self$random_effect %in% colnames(newdata)) {
+        if (!grepl(self$random_effect, predictors)) {
+          predictors <- paste(predictors, "+", self$random_effect)
+        }
+      }
+      
+      X_formula <- as.formula(paste("~", predictors))
+      X <- try(model.matrix(X_formula, data = newdata), silent = TRUE)
+      
+      if (inherits(X, "try-error")) {
+        pred_vars <- strsplit(predictors, "\\+")[[1]]
+        pred_vars <- trimws(pred_vars)
+        simple_vars <- pred_vars[!grepl(":", pred_vars) & !grepl("\\*", pred_vars)]
+        simple_formula <- as.formula(paste("~", paste(simple_vars, collapse = " + ")))
+        X <- model.matrix(simple_formula, data = newdata)
+      }
+      
+      beta <- self$results$samples$beta
+      beta_mean <- apply(beta, 2, mean)
+      
+      if (length(beta_mean) != ncol(X)) {
+        if (length(beta_mean) > ncol(X)) {
+          beta_mean <- beta_mean[1:ncol(X)]
+        } else {
+          X <- X[, 1:length(beta_mean)]
+        }
+      }
+      
+      eta <- X %*% beta_mean
+      lambda <- exp(eta)
+      
+      if (!is.null(self$results$samples$phi)) {
+        phi_mean <- apply(self$results$samples$phi, 2, mean)
+        if (nrow(newdata) == length(phi_mean)) {
+          lambda <- lambda * exp(phi_mean)
+        }
+      }
+      
+      return(lambda)
+    },
+    
+    create_W_list = function(W) {
+      n <- nrow(W)
+      W_list <- list()
+      W_list$n <- n
+      
+      W_list$adj <- vector("list", n)
+      W_list$weights <- vector("list", n)
+      W_list$num <- numeric(n)
+      
+      for (i in 1:n) {
+        neighbors <- which(W[i, ] > 0)
+        W_list$adj[[i]] <- neighbors
+        W_list$weights[[i]] <- W[i, neighbors]
+        W_list$num[i] <- length(neighbors)
+      }
+      
+      W_list$sumjk <- sum(W_list$num)
+      return(W_list)
+    }
   )
-  
-  return(model)
-}
+)
 
-evaluate_model <- function(model, test_data) {
-  # Extract fitted values from the model
-  fitted_values <- model$fitted.values
-  
-  # Calculate performance metrics
-  if ("acc" %in% colnames(test_data)) {
-    observed <- test_data$acc
-    rmse_val <- rmse(observed, fitted_values)
-    mae_val <- mae(observed, fitted_values)
-    
-    # Calculate R-squared
-    ss_total <- sum((observed - mean(observed))^2)
-    ss_residual <- sum((observed - fitted_values)^2)
-    r_squared <- 1 - (ss_residual / ss_total)
-    
-    return(list(
-      rmse = rmse_val,
-      mae = mae_val,
-      r_squared = r_squared
-    ))
-  } else {
-    warning("Test data does not contain 'acc' column for evaluation")
-    return(NULL)
-  }
-}
-
-# Main function to run the CARleroux model
+# Then modify the run_car_leroux_analysis function to use this class
 run_car_leroux_analysis <- function(k_neighbors = 5, max_features = 15) {
   # Load and prepare data
   data <- load_and_prepare_data()
-  str(data)  # Check if data loaded properly
   
   # Create train-test split
   set.seed(42)
   train_idx <- createDataPartition(data$acc, p = 0.8, list = FALSE)
   train_data <- data[train_idx, ]
   test_data <- data[-train_idx, ]
-  
-  # Create spatial weights matrix
-  W <- create_spatial_weights(train_data, k_neighbors = k_neighbors)
   
   # Select features using LASSO
   feature_cols <- names(train_data)[!names(train_data) %in% c('int_no', 'acc', 'pi', 'borough', 'x', 'y')]
@@ -199,35 +293,40 @@ run_car_leroux_analysis <- function(k_neighbors = 5, max_features = 15) {
   print(selected_features)
   
   # Create formula for the model
-  formula_str <- paste("acc ~ ", paste(selected_features, collapse = " + "))
-  formula <- as.formula(formula_str)
+  formula_str <- paste("acc ~", paste(selected_features, collapse = " + "))
   
-  # Fit the CARleroux model
+  # Create and fit the CARBayes model
+  carbayes <- carbayes_model$new(
+    data = train_data,
+    formula = formula_str,
+    random_effect = "borough",
+    spatial_vars = c('x', 'y')
+  )
+  
   cat("Fitting CARleroux model...\n")
-  model <- fit_car_leroux_model(train_data, formula, W)
+  model_results <- carbayes$fit()
   
-  # Summary of the model
-  print(model)
-  
-  # Evaluate on test data
-  cat("Evaluating model on test data...\n")
-  
-  # Create spatial weights for test data
-  W_test <- create_spatial_weights(test_data, k_neighbors = k_neighbors)
-  
-  # Apply model to test data
-  test_formula <- update(formula, acc ~ .)
-  test_model <- fit_car_leroux_model(test_data, test_formula, W_test)
+  # Make predictions on train and test data
+  train_predictions <- carbayes$predict(train_data)
+  test_predictions <- carbayes$predict(test_data)
   
   # Evaluate performance
-  metrics <- evaluate_model(test_model, test_data)
-  print("Performance metrics:")
-  print(metrics)
+  train_metrics <- list(
+    mae = mean(abs(train_data$acc - train_predictions)),
+    mse = mean((train_data$acc - train_predictions)^2),
+    rmse = sqrt(mean((train_data$acc - train_predictions)^2))
+  )
   
-  # Create plots of observed vs. fitted values
+  test_metrics <- list(
+    mae = mean(abs(test_data$acc - test_predictions)),
+    mse = mean((test_data$acc - test_predictions)^2),
+    rmse = sqrt(mean((test_data$acc - test_predictions)^2))
+  )
+  
+  # Create plots
   plot_data <- data.frame(
     Observed = test_data$acc,
-    Fitted = test_model$fitted.values
+    Fitted = test_predictions
   )
   
   p <- ggplot(plot_data, aes(x = Observed, y = Fitted)) +
@@ -240,30 +339,17 @@ run_car_leroux_analysis <- function(k_neighbors = 5, max_features = 15) {
   
   print(p)
   
-  # If spatial data is available, create a map of residuals
-  if (all(c("x", "y") %in% colnames(test_data))) {
-    test_data$residuals <- test_data$acc - test_model$fitted.values
-    
-    # Convert to sf object for mapping
-    test_sf <- st_as_sf(test_data, coords = c("x", "y"), crs = 32618)  # UTM Zone 18N for Montreal
-    
-    # Map residuals
-    map <- mapview(test_sf, zcol = "residuals", layer.name = "Residuals")
-    print(map)
-  }
-  
   return(list(
-    model = model,
-    test_model = test_model,
-    metrics = metrics,
-    selected_features = selected_features
+    model = carbayes,
+    train_metrics = train_metrics,
+    test_metrics = test_metrics,
+    selected_features = selected_features,
+    test_predictions = test_predictions,
+    test_actual = test_data$acc
   ))
 }
 
-# Example usage:
-# results <- run_car_leroux_analysis(k_neighbors = 5, max_features = 15)
-
-# Fixed function to gather predictions and create a map
+# Modified map_cv_predictions function to include observed accidents in output file and make dots bigger
 map_cv_predictions <- function(cv_results, original_data, folds, save_maps = TRUE) {
   # Create a dataframe to store all test predictions
   all_predictions <- data.frame()
@@ -280,7 +366,7 @@ map_cv_predictions <- function(cv_results, original_data, folds, save_maps = TRU
     test_data <- original_data[test_indices, ]
     
     # Get fitted values - these are already in the original scale
-    fitted_values <- fold_results$test_model$fitted.values
+    fitted_values <- fold_results$test_predictions
     
     # Create a dataframe with predictions for this fold
     fold_predictions <- data.frame(
@@ -313,151 +399,81 @@ map_cv_predictions <- function(cv_results, original_data, folds, save_maps = TRU
   # Convert to sf object for mapping
   predictions_sf <- st_as_sf(all_predictions, coords = c("x", "y"), crs = 32618)
   
-  # Create maps with enhanced visualization
-  # Note: mapview automatically puts the legend on the side
+  # Create only the predicted map with mapview - now with larger dots
   map_predicted <- mapview(predictions_sf, zcol = "predicted", 
-                           layer.name = "Predicted Accidents",
-                           col.regions = viridis::plasma,
-                           legend = TRUE,
-                           cex = "predicted", # Size dots by prediction value
-                           alpha.regions = 0.8) # Slight transparency
-  
-  map_observed <- mapview(predictions_sf, zcol = "observed", 
-                          layer.name = "Observed Accidents",
+                          layer.name = "Predicted Accidents",
                           col.regions = viridis::plasma,
                           legend = TRUE,
-                          cex = "observed", # Size dots by observation value
+                          cex = 5,  # Increased size for all dots (was 3)
                           alpha.regions = 0.8)
   
-  map_error <- mapview(predictions_sf, zcol = "error", 
-                       layer.name = "Prediction Error",
-                       col.regions = viridis::viridis,
-                       legend = TRUE,
-                       alpha.regions = 0.8)
-  
-  # Create a combined map
-  combined_map <- map_predicted + map_observed + map_error
-  
+  # Create a plot of observed vs predicted for all data
   # Create a plot of observed vs predicted for all data
   pred_vs_obs_plot <- ggplot(all_predictions, aes(x = observed, y = predicted)) +
-    geom_point(alpha = 0.5) +
-    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
-    labs(title = "All Folds: Observed vs. Predicted Accidents",
-         x = "Observed Accidents",
-         y = "Predicted Accidents") +
-    theme_minimal()
+      geom_point(alpha = 0.5) +
+      geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+      labs(title = "All Folds: Observed vs. Predicted Accidents",
+          x = "Observed Accidents",
+          y = "Predicted Accidents") +
+      theme_minimal() +
+      theme(
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      )
   
   # Save maps and plots if requested
   if (save_maps) {
     # Create output directory if it doesn't exist
     dir.create("output", showWarnings = FALSE)
     
+    # Create the predictions data frame with intersection ID, observed and predicted accidents
+    simplified_predictions <- all_predictions[, c("int_no", "observed", "predicted")]
+    
+    # Sort by predicted accidents (descending)
+    simplified_predictions <- simplified_predictions[order(simplified_predictions$predicted, decreasing = TRUE), ]
+    
+    # Save the predictions data with observed column
+    write.csv(simplified_predictions, "output/accidents_predictions.csv", row.names = FALSE)
+    
     # Convert the mapview objects to static plots using tmap
     tmap_mode("plot")
     
-    # Convert mapview objects to tmap objects and save as PNG
-    # Enhanced tmap version with improved legend and dot sizing
-    tmap_obs <- tmap::tm_shape(predictions_sf) + 
-      tm_dots(col = "observed", 
-              palette = "plasma", 
-              title = "Observed Accidents",
-              size = "observed",
-              sizes.legend = c(min(predictions_sf$observed), 
-                              median(predictions_sf$observed), 
-                              max(predictions_sf$observed)),
-              size.lim = c(min(predictions_sf$observed), max(predictions_sf$observed)),
-              alpha = 0.8,
-              legend.size.show = TRUE) +
-      tm_layout(legend.outside = TRUE, 
-                legend.position = c("right", "center"),
-                legend.title.size = 1.2,
-                legend.text.size = 0.8,
-                frame = FALSE)
-    tmap::tmap_save(tmap_obs, filename = "output/observed_accidents_map.png", width = 10, height = 8)
-    
-    # Enhanced predicted accidents map
+    # Create modern tmap v4 compatible code for predicted accidents map
+    # With single legend and uniform but larger dot sizes
     tmap_pred <- tmap::tm_shape(predictions_sf) + 
-      tm_dots(col = "predicted", 
-              palette = "plasma", 
-              title = "Predicted Accidents",
-              size = "predicted",
-              sizes.legend = c(min(predictions_sf$predicted), 
-                              median(predictions_sf$predicted), 
-                              max(predictions_sf$predicted)),
-              size.lim = c(min(predictions_sf$predicted), max(predictions_sf$predicted)),
-              alpha = 0.8,
-              legend.size.show = TRUE) +
-      tm_layout(legend.outside = TRUE, 
-                legend.position = c("right", "center"),
-                legend.title.size = 1.2,
-                legend.text.size = 0.8,
-                frame = FALSE)
+      tmap::tm_dots(
+        fill = "predicted",                    # Color dots by predicted value 
+        fill.scale = tm_scale(                 # Use scale object for styling
+          values = "plasma",                   # Color palette
+          title = "Predicted Accidents"        # Legend title
+        ),
+        size = 0.2,                            # Increased fixed size for all dots (was 0.1)
+        fill_alpha = 0.8                       # Use fill_alpha instead of alpha
+      ) +
+      tm_layout(
+        legend.outside = TRUE,                 # Place legend outside
+        legend.outside.position = "right",     # Position on the right
+        legend.title.size = 1.2,               # Title size
+        legend.text.size = 0.8,                # Text size
+        frame = FALSE                          # No frame
+      )
+    
+    # Save the map
     tmap::tmap_save(tmap_pred, filename = "output/predicted_accidents_map.png", width = 10, height = 8)
-    
-    # Enhanced error map
-    tmap_error <- tmap::tm_shape(predictions_sf) + 
-      tm_dots(col = "error", 
-              palette = "viridis", 
-              title = "Prediction Error",
-              size = 0.1,
-              alpha = 0.8) +
-      tm_layout(legend.outside = TRUE, 
-                legend.position = c("right", "center"),
-                legend.title.size = 1.2,
-                legend.text.size = 0.8,
-                frame = FALSE)
-    tmap::tmap_save(tmap_error, filename = "output/prediction_error_map.png", width = 10, height = 8)
-    
-    # Create a combined static map with improved styling
-    tmap_combined <- tm_shape(predictions_sf) + 
-      tm_dots(col = "observed", 
-              palette = "plasma", 
-              title = "Observed Accidents",
-              size = "observed",
-              alpha = 0.8) +
-      tm_layout(panel.show = TRUE, 
-                panel.labels = "Observed",
-                legend.outside = TRUE, 
-                legend.position = c("right", "center")) +
-      tm_facets(sync = TRUE, ncol = 3) +
-      tm_shape(predictions_sf) + 
-      tm_dots(col = "predicted", 
-              palette = "plasma", 
-              title = "Predicted Accidents",
-              size = "predicted",
-              alpha = 0.8) +
-      tm_layout(panel.show = TRUE, 
-                panel.labels = "Predicted",
-                legend.outside = TRUE, 
-                legend.position = c("right", "center")) +
-      tm_shape(predictions_sf) + 
-      tm_dots(col = "error", 
-              palette = "viridis", 
-              title = "Prediction Error",
-              alpha = 0.8) +
-      tm_layout(panel.show = TRUE, 
-                panel.labels = "Error",
-                legend.outside = TRUE, 
-                legend.position = c("right", "center"))
-    tmap::tmap_save(tmap_combined, filename = "output/combined_map.png", width = 15, height = 5)
     
     # Save the observed vs. predicted plot
     ggsave("output/observed_vs_predicted.png", pred_vs_obs_plot, width = 10, height = 8)
     
-    # Save the predictions data
-    write.csv(all_predictions, "output/accidents_predictions.csv", row.names = FALSE)
-    
-    cat("Maps and plots saved as PNG files to the 'output' directory\n")
+    cat("Map of predicted accidents saved to output/predicted_accidents_map.png\n")
+    cat("Accident predictions with observed and predicted values saved to output/accidents_predictions.csv\n")
+    cat("Observed vs. predicted plot saved to output/observed_vs_predicted.png\n")
   }
   
-  # Return the sf object and maps
+  # Return only the predicted map and relevant data
   return(list(
     predictions = all_predictions,
     predictions_sf = predictions_sf,
     map_predicted = map_predicted,
-    map_observed = map_observed,
-    map_error = map_error,
-    combined_map = combined_map,
     pred_vs_obs_plot = pred_vs_obs_plot
   ))
 }
@@ -492,9 +508,6 @@ run_car_leroux_cv <- function(k_neighbors = 5, max_features = 15, k_folds = 5) {
     train_data <- data[train_indices, ]
     test_data <- data[test_indices, ]
     
-    # Create spatial weights matrix for training data
-    W <- create_spatial_weights(train_data, k_neighbors = k_neighbors)
-    
     # Select features using LASSO on this fold's training data
     feature_cols <- names(train_data)[!names(train_data) %in% c('int_no', 'acc', 'pi', 'borough', 'x', 'y')]
     X_train <- train_data[, feature_cols]
@@ -505,34 +518,38 @@ run_car_leroux_cv <- function(k_neighbors = 5, max_features = 15, k_folds = 5) {
     print(selected_features)
     
     # Create formula for the model
-    formula_str <- paste("acc ~ ", paste(selected_features, collapse = " + "))
-    formula <- as.formula(formula_str)
+    formula_str <- paste("acc ~", paste(selected_features, collapse = " + "))
     
-    # Fit the CARleroux model
+    # Create and fit the CARBayes model
+    carbayes <- carbayes_model$new(
+      data = train_data,
+      formula = formula_str,
+      random_effect = "borough",
+      spatial_vars = c('x', 'y')
+    )
+    
     cat("Fitting CARleroux model for fold", fold_idx, "...\n")
-    model <- fit_car_leroux_model(train_data, formula, W)
+    model_results <- carbayes$fit()
     
-    # Create spatial weights for test data
-    W_test <- create_spatial_weights(test_data, k_neighbors = k_neighbors)
-    
-    # Apply model to test data
-    test_formula <- update(formula, acc ~ .)
-    test_model <- fit_car_leroux_model(test_data, test_formula, W_test)
+    # Make predictions on train and test data
+    train_predictions <- carbayes$predict(train_data)
+    test_predictions <- carbayes$predict(test_data)
     
     # Calculate metrics
-    fitted_values <- test_model$fitted.values
-    observed_values <- test_data$acc
+    train_mae <- mean(abs(train_data$acc - train_predictions))
+    train_mse <- mean((train_data$acc - train_predictions)^2)
+    train_rmse <- sqrt(train_mse)
     
-    mae_val <- mean(abs(observed_values - fitted_values))
-    mse_val <- mean((observed_values - fitted_values)^2)
-    rmse_val <- sqrt(mse_val)
+    test_mae <- mean(abs(test_data$acc - test_predictions))
+    test_mse <- mean((test_data$acc - test_predictions)^2)
+    test_rmse <- sqrt(test_mse)
     
     # Store metrics for this fold
     fold_metrics <- data.frame(
       fold = fold_idx,
-      mae = mae_val,
-      mse = mse_val,
-      rmse = rmse_val,
+      mae = test_mae,
+      mse = test_mse,
+      rmse = test_rmse,
       stringsAsFactors = FALSE
     )
     
@@ -540,22 +557,22 @@ run_car_leroux_cv <- function(k_neighbors = 5, max_features = 15, k_folds = 5) {
     
     # Print metrics for this fold
     cat(paste0("Fold ", fold_idx, " metrics:\n"))
-    cat(paste0("  MAE: ", round(mae_val, 4), "\n"))
-    cat(paste0("  MSE: ", round(mse_val, 4), "\n"))
-    cat(paste0("  RMSE: ", round(rmse_val, 4), "\n"))
+    cat(paste0("  MAE: ", round(test_mae, 4), "\n"))
+    cat(paste0("  MSE: ", round(test_mse, 4), "\n"))
+    cat(paste0("  RMSE: ", round(test_rmse, 4), "\n"))
     
     # Store the model and results
     cv_results[[paste0("fold_", fold_idx)]] <- list(
-      model = model,
-      test_model = test_model,
+      model = carbayes,
+      test_predictions = test_predictions,
       selected_features = selected_features,
       metrics = fold_metrics
     )
     
     # Create plot of observed vs. fitted values for this fold
     plot_data <- data.frame(
-      Observed = observed_values,
-      Fitted = fitted_values
+      Observed = test_data$acc,
+      Fitted = test_predictions
     )
     
     p <- ggplot(plot_data, aes(x = Observed, y = Fitted)) +
@@ -564,7 +581,11 @@ run_car_leroux_cv <- function(k_neighbors = 5, max_features = 15, k_folds = 5) {
       labs(title = paste0("Fold ", fold_idx, ": Observed vs. Fitted Values"),
            x = "Observed Accidents",
            y = "Fitted Accidents") +
-      theme_minimal()
+      theme_minimal() +
+      theme(
+        panel.background = element_rect(fill = "white"),
+        plot.background = element_rect(fill = "white")
+      )
     
     print(p)
   }
@@ -593,7 +614,7 @@ run_car_leroux_cv <- function(k_neighbors = 5, max_features = 15, k_folds = 5) {
     test_data <- data[test_indices, ]
     
     # Get fitted values
-    fitted_values <- fold_results$test_model$fitted.values
+    fitted_values <- fold_results$test_predictions
     observed_values <- test_data$acc
     
     # Create a data frame with observed and predicted values
@@ -627,8 +648,8 @@ results_cv <- run_car_leroux_cv(k_neighbors = 5, max_features = 15, k_folds = 5)
 # Generate maps of predictions and save them
 prediction_maps <- map_cv_predictions(results_cv$cv_results, results_cv$data, results_cv$folds, save_maps = TRUE)
 
-# Display the combined map
-prediction_maps$combined_map
+# Display the predicted map
+prediction_maps$map_predicted
 
 # Display the observed vs predicted plot
 print(prediction_maps$pred_vs_obs_plot)

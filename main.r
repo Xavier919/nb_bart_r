@@ -221,8 +221,8 @@ carbayes_model <- R6::R6Class(
         family = "poisson",  
         data = data_to_use,
         W = self$W,
-        burnin = 2000,
-        n.sample = 5000,
+        burnin = 1000,
+        n.sample = 2000,
         thin = 2,
         rho = 0.8,
         verbose = TRUE
@@ -553,9 +553,8 @@ generate_cv_figures <- function(cv_results, data) {
   
   # Create map of predicted accidents
   map_plot <- ggplot() +
-    geom_sf(data = sf_predictions, aes(color = predicted, size = predicted)) +
+    geom_sf(data = sf_predictions, aes(color = predicted), size = 1) +
     scale_color_viridis_c(name = "Predicted\nAccidents") +
-    scale_size_continuous(name = "Predicted\nAccidents", range = c(1, 5)) +
     theme_classic() +
     theme(
       panel.background = element_rect(fill = "white", color = NA),
