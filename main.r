@@ -224,7 +224,7 @@ carbayes_model <- R6::R6Class(
         burnin = 2000,
         n.sample = 5000,
         thin = 2,
-        rho = 0.5,
+        rho = 0.8,
         verbose = TRUE
       )
       
@@ -500,6 +500,95 @@ run_combined_cross_validation <- function(data, response_var = "acc", k = 5, ran
   ))
 }
 
+# Generate figures from cross-validation results
+generate_cv_figures <- function(cv_results, data) {
+  # Figure 1: Map of predicted accidents
+  # Create a data frame to store all predictions
+  all_predictions <- data.frame(
+    x = data$x,
+    y = data$y,
+    actual = data$acc,
+    predicted = NA
+  )
+  
+  # Get all test predictions from cross-validation results
+  test_actual_combined <- cv_results$carbayes_results$test_actual
+  test_predicted_combined <- cv_results$carbayes_results$test_predicted
+  
+  # Create a more robust way to match predictions back to original data
+  # First, collect all test indices from each fold
+  all_test_indices <- list()
+  for (i in 1:length(cv_results$carbayes_results$fold_results)) {
+    # Recreate the fold indices
+    set.seed(42)
+    folds <- createFolds(data$acc, k = length(cv_results$carbayes_results$fold_results), returnTrain = TRUE)
+    train_idx <- folds[[i]]
+    test_idx <- setdiff(1:nrow(data), train_idx)
+    all_test_indices[[i]] <- test_idx
+  }
+  
+  # Now assign predictions to the correct indices
+  start_idx <- 1
+  for (i in 1:length(all_test_indices)) {
+    test_idx <- all_test_indices[[i]]
+    end_idx <- start_idx + length(test_idx) - 1
+    
+    # Make sure we don't go beyond the available predictions
+    if (end_idx <= length(test_predicted_combined)) {
+      fold_predictions <- test_predicted_combined[start_idx:end_idx]
+      all_predictions$predicted[test_idx] <- fold_predictions
+      start_idx <- end_idx + 1
+    }
+  }
+  
+  # Remove any rows with NA predictions
+  all_predictions <- all_predictions[!is.na(all_predictions$predicted), ]
+  
+  # Create spatial points data frame for mapping
+  sp_predictions <- all_predictions
+  coordinates(sp_predictions) <- ~ x + y
+  
+  # Convert to sf for better mapping
+  sf_predictions <- st_as_sf(sp_predictions)
+  
+  # Create map of predicted accidents
+  map_plot <- ggplot() +
+    geom_sf(data = sf_predictions, aes(color = predicted, size = predicted)) +
+    scale_color_viridis_c(name = "Predicted\nAccidents") +
+    scale_size_continuous(name = "Predicted\nAccidents", range = c(1, 5)) +
+    theme_classic() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA),
+      legend.position = "right"
+    ) +
+    labs(title = "Map of Predicted Accidents",
+         subtitle = "CARBayes Model Cross-Validation Results")
+  
+  # Figure 2: Predicted vs Actual values
+  scatter_plot <- ggplot(all_predictions, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.5) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    geom_smooth(method = "lm", color = "blue", se = TRUE) +
+    theme_classic() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA)
+    ) +
+    labs(title = "Predicted vs Actual Accidents",
+         subtitle = "CARBayes Model Cross-Validation Results",
+         x = "Actual Accidents",
+         y = "Predicted Accidents")
+  
+  # Calculate correlation
+  correlation <- cor(all_predictions$actual, all_predictions$predicted)
+  cat(sprintf("\nCorrelation between actual and predicted values: %.4f\n", correlation))
+  
+  return(list(map_plot = map_plot, scatter_plot = scatter_plot, predictions = all_predictions))
+}
+
 # Main execution
 cat("Loading and preparing data...\n")
 full_data <- load_and_prepare_data()
@@ -567,3 +656,132 @@ comparison_df <- data.frame(
 )
 
 print(comparison_df)
+
+# After running cross-validation, generate and display the figures
+cat("\nGenerating figures from cross-validation results...\n")
+figures <- generate_cv_figures(cv_results, full_data)
+
+# Save the figures
+ggsave("predicted_accidents_map.png", figures$map_plot, width = 10, height = 8)
+ggsave("predicted_vs_actual.png", figures$scatter_plot, width = 8, height = 6)
+
+cat("\nFigures saved as 'predicted_accidents_map.png' and 'predicted_vs_actual.png'\n")
+
+# Display summary statistics of predictions
+cat("\nSummary of predictions:\n")
+print(summary(figures$predictions$predicted))
+print(summary(figures$predictions$actual))
+
+# Calculate additional metrics
+cat("\nAdditional metrics:\n")
+cat(sprintf("Correlation: %.4f\n", cor(figures$predictions$actual, figures$predictions$predicted)))
+cat(sprintf("R-squared: %.4f\n", cor(figures$predictions$actual, figures$predictions$predicted)^2))
+
+# Fit CARBayes model on the whole dataset
+cat("\nFitting CARBayes model on the whole dataset...\n")
+
+# Use the most common features from cross-validation
+top_features <- cv_results$feature_consistency$Feature[cv_results$feature_consistency$Percentage >= 60]
+if (length(top_features) < 5) {
+  top_features <- cv_results$feature_consistency$Feature[1:min(5, nrow(cv_results$feature_consistency))]
+}
+
+final_formula <- paste("acc ~", paste(top_features, collapse = " + "))
+cat(sprintf("Using formula: %s\n", final_formula))
+
+final_carbayes <- carbayes_model$new(
+  data = full_data,
+  formula = final_formula,
+  random_effect = "borough",
+  exposure = NULL,
+  spatial_vars = c('x', 'y')
+)
+
+final_results <- final_carbayes$fit()
+
+# Extract coefficient estimates and credible intervals
+beta_samples <- final_results$samples$beta
+beta_means <- apply(beta_samples, 2, mean)
+beta_lower <- apply(beta_samples, 2, function(x) quantile(x, 0.025))
+beta_upper <- apply(beta_samples, 2, function(x) quantile(x, 0.975))
+
+# Create a data frame for plotting
+coef_names <- colnames(beta_samples)
+if (is.null(coef_names)) {
+  # Get the actual variable names from the model formula
+  model_terms <- attr(terms(as.formula(final_formula)), "term.labels")
+  # Add intercept as the first term
+  coef_names <- c("(Intercept)", model_terms)
+  
+  # If there are factor variables that expand to multiple coefficients,
+  # this might not match exactly. In that case, extract from model matrix
+  if (length(coef_names) != ncol(beta_samples)) {
+    X_formula <- as.formula(paste("~", paste(model_terms, collapse = " + ")))
+    X_matrix <- model.matrix(X_formula, data = full_data)
+    coef_names <- colnames(X_matrix)
+  }
+}
+
+coef_df <- data.frame(
+  Variable = coef_names,
+  Estimate = beta_means,
+  Lower = beta_lower,
+  Upper = beta_upper
+)
+
+# Remove intercept for better visualization if needed
+if ("(Intercept)" %in% coef_df$Variable) {
+  intercept_row <- coef_df[coef_df$Variable == "(Intercept)",]
+  coef_df <- coef_df[coef_df$Variable != "(Intercept)",]
+  cat(sprintf("\nIntercept estimate: %.4f (%.4f, %.4f)\n", 
+              intercept_row$Estimate, intercept_row$Lower, intercept_row$Upper))
+}
+
+# Sort by absolute effect size for better visualization
+coef_df$Variable <- factor(coef_df$Variable, 
+                          levels = coef_df$Variable[order(abs(coef_df$Estimate), decreasing = TRUE)])
+
+# Create the coefficient plot
+coef_plot <- ggplot(coef_df, aes(x = Variable, y = Estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    axis.text.y = element_text(size = 10)
+  ) +
+  labs(title = "CARBayes Model Coefficient Estimates",
+       subtitle = "With 95% Credible Intervals",
+       x = "",
+       y = "Coefficient Estimate")
+
+# Save the coefficient plot
+ggsave("coefficient_plot.png", coef_plot, width = 10, height = 8)
+cat("\nCoefficient plot saved as 'coefficient_plot.png'\n")
+
+# Print summary of coefficients
+cat("\nCoefficient estimates with 95% credible intervals:\n")
+coef_summary <- coef_df
+coef_summary$Significant <- ifelse(coef_summary$Lower * coef_summary$Upper > 0, "Yes", "No")
+print(coef_summary[order(abs(coef_summary$Estimate), decreasing = TRUE), ])
+
+# Calculate model fit statistics
+cat("\nModel fit statistics:\n")
+cat(sprintf("DIC: %.4f\n", final_results$DIC))
+cat(sprintf("pD: %.4f\n", final_results$pd))
+
+# Calculate predictions on the full dataset
+final_predictions <- final_carbayes$predict(full_data)
+final_mae <- mean(abs(full_data$acc - final_predictions), na.rm = TRUE)
+final_rmse <- sqrt(mean((full_data$acc - final_predictions)^2, na.rm = TRUE))
+final_correlation <- cor(full_data$acc, final_predictions)
+
+cat("\nFinal model performance on full dataset:\n")
+cat(sprintf("MAE: %.4f\n", final_mae))
+cat(sprintf("RMSE: %.4f\n", final_rmse))
+cat(sprintf("Correlation: %.4f\n", final_correlation))
+cat(sprintf("R-squared: %.4f\n", final_correlation^2))
