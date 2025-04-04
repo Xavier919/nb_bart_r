@@ -432,7 +432,6 @@ cv_results <- run_cross_validation(
   max_features = 30
 )
 
-# Extract and display metrics for each fold
 cat("Metrics by fold:\n")
 cat("---------------\n")
 for (i in 1:length(cv_results$fold_results)) {
@@ -441,7 +440,6 @@ for (i in 1:length(cv_results$fold_results)) {
               i, fold$test_mae, fold$test_mse, fold$test_rmse))
 }
 
-# Calculate mean performance across folds
 mean_mae <- mean(sapply(cv_results$fold_results, function(x) x$test_mae))
 mean_mse <- mean(sapply(cv_results$fold_results, function(x) x$test_mse))
 mean_rmse <- mean(sapply(cv_results$fold_results, function(x) x$test_rmse))
@@ -451,9 +449,3 @@ cat("---------------------------\n")
 cat(sprintf("Mean MAE: %.4f\n", mean_mae))
 cat(sprintf("Mean MSE: %.4f\n", mean_mse))
 cat(sprintf("Mean RMSE: %.4f\n", mean_rmse))
-
-cat("\nOverall performance (combined predictions):\n")
-cat("----------------------------------------\n")
-cat(sprintf("Overall MAE: %.4f\n", cv_results$overall_mae))
-cat(sprintf("Overall MSE: %.4f\n", cv_results$overall_mse))
-cat(sprintf("Overall RMSE: %.4f\n", cv_results$overall_rmse))
