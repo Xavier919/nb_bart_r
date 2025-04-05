@@ -226,9 +226,9 @@ carbayes_model <- R6::R6Class(
         family = "poisson",  
         data = data_to_use,
         W = self$W,
-        burnin = 5000,
-        n.sample = 10000,
-        thin = 5,
+        burnin = 2000,
+        n.sample = 5000,
+        thin = 2,
         #rho = 0.8,
         verbose = TRUE
       )
@@ -351,6 +351,7 @@ run_combined_cross_validation <- function(data, response_var = "acc", k = 5, ran
   
   carbayes_test_actual <- list()
   carbayes_test_predicted <- list()
+  carbayes_test_ids <- list()
   sem_test_actual <- list()
   sem_test_predicted <- list()
   inla_test_actual <- list()
@@ -535,6 +536,7 @@ run_combined_cross_validation <- function(data, response_var = "acc", k = 5, ran
     # Store actuals and predictions for overall calculation
     carbayes_test_actual[[i]] <- test_data[[response_var]]
     carbayes_test_predicted[[i]] <- carbayes_test_preds
+    carbayes_test_ids[[i]] <- test_data$int_no
     sem_test_actual[[i]] <- test_data[[response_var]]
     sem_test_predicted[[i]] <- sem_test_preds
     inla_test_actual[[i]] <- test_data[[response_var]]
@@ -544,6 +546,7 @@ run_combined_cross_validation <- function(data, response_var = "acc", k = 5, ran
   # --- Combine results and calculate overall metrics ---
   carbayes_test_actual_combined <- unlist(carbayes_test_actual)
   carbayes_test_predicted_combined <- unlist(carbayes_test_predicted)
+  carbayes_test_ids_combined <- unlist(carbayes_test_ids)
   sem_test_actual_combined <- unlist(sem_test_actual)
   sem_test_predicted_combined <- unlist(sem_test_predicted)
   inla_test_actual_combined <- unlist(inla_test_actual)
@@ -581,7 +584,9 @@ run_combined_cross_validation <- function(data, response_var = "acc", k = 5, ran
     carbayes_results = list(
       fold_results = carbayes_fold_results,
       overall_mae = carbayes_overall_mae, overall_mse = carbayes_overall_mse, overall_rmse = carbayes_overall_rmse,
-      test_actual = carbayes_test_actual_combined, test_predicted = carbayes_test_predicted_combined
+      test_ids = carbayes_test_ids_combined,
+      test_actual = carbayes_test_actual_combined, 
+      test_predicted = carbayes_test_predicted_combined
     ),
     sem_results = list(
       fold_results = sem_fold_results,
@@ -795,3 +800,25 @@ print(summary(figures$predictions$actual))
 cat("\nAdditional metrics:\n")
 cat(sprintf("Correlation: %.4f\n", cor(figures$predictions$actual, figures$predictions$predicted)))
 cat(sprintf("R-squared: %.4f\n", cor(figures$predictions$actual, figures$predictions$predicted)^2))
+
+# Create and save the CARBayes predictions CSV
+cat("\nCreating and saving CARBayes predictions CSV...\n")
+# Retrieve the combined IDs and predictions
+pred_ids <- cv_results$carbayes_results$test_ids
+pred_values <- cv_results$carbayes_results$test_predicted
+
+# Create the data frame
+predictions_df <- data.frame(
+  int_no = pred_ids,
+  predicted_accidents = pred_values
+)
+
+# Remove rows with NA predictions (if any fold failed)
+predictions_df <- predictions_df[!is.na(predictions_df$predicted_accidents), ]
+
+# Sort the data frame by predicted accidents (descending)
+predictions_df <- predictions_df[order(predictions_df$predicted_accidents, decreasing = TRUE), ]
+
+# Write to CSV
+write.csv(predictions_df, "carbayes_predictions.csv", row.names = FALSE)
+cat("CARBayes predictions saved to carbayes_predictions.csv\n")

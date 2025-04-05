@@ -372,7 +372,7 @@ carbayes_final <- carbayes_model$new(
   spatial_vars = c('x', 'y')
 )
 
-carbayes_results <- try(carbayes_final$fit(burnin = 5000, n_sample = 10000, thin = 5), silent = FALSE)
+carbayes_results <- try(carbayes_final$fit(burnin = 2000, n_sample = 5000, thin = 2), silent = FALSE)
 
 if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_results)) {
   cat("\n==== CARBayes Model Summary ====\n")
