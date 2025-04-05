@@ -431,7 +431,7 @@ if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_final) && !is.
     # Color intensity represents the weight (inverse distance) - higher is stronger/closer
     geom_segment(data = links, aes(x = x_start, y = y_start, xend = x_end, yend = y_end, color = weight), alpha = 0.5) +
     # Draw the intersections (points)
-    geom_point(data = coords, aes(x = x, y = y), size = 1, color = "black") +
+    geom_point(data = coords, aes(x = x, y = y), size = 0.5, color = "black") +
     # Use a color scale appropriate for continuous weights
     scale_color_viridis_c(option = "plasma", name = "Spatial Weight\n(Inverse Distance)") +
     # Add titles and labels
@@ -457,5 +457,72 @@ if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_final) && !is.
   cat("Skipping visualization because model fitting failed or W matrix is unavailable.\n")
 }
 # --- End of Visualization Code ---
+
+# --- Add Coefficient Visualization Code Here ---
+cat("\n--- Generating Coefficient Plot ---\n")
+
+# Check if the model results are available
+if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_results) && !is.null(carbayes_results$summary.results)) {
+
+  # Extract summary results
+  summary_df <- as.data.frame(carbayes_results$summary.results)
+  summary_df$Parameter <- rownames(summary_df)
+
+  # Filter out non-coefficient parameters if desired (e.g., tau2, rho, intercept for some plots)
+  # Let's keep the intercept for now, but filter out variance/spatial parameters
+  coef_df <- summary_df[!grepl("^(tau2|rho|deviance|loglikelihood)", summary_df$Parameter, ignore.case = TRUE), ]
+
+  # Rename columns for clarity (assuming standard CARBayes output names)
+  # Adjust column names if your CARBayes version outputs different names
+  if (all(c("Mean", "2.5%", "97.5%") %in% colnames(coef_df))) {
+      names(coef_df)[names(coef_df) == "Mean"] <- "Estimate"
+      names(coef_df)[names(coef_df) == "2.5%"] <- "LowerCI"
+      names(coef_df)[names(coef_df) == "97.5%"] <- "UpperCI"
+  } else if (all(c("Median", "2.5%", "97.5%") %in% colnames(coef_df))) {
+      # Alternative: Use Median if Mean is not present or preferred
+      names(coef_df)[names(coef_df) == "Median"] <- "Estimate"
+      names(coef_df)[names(coef_df) == "2.5%"] <- "LowerCI"
+      names(coef_df)[names(coef_df) == "97.5%"] <- "UpperCI"
+      cat("Using Median for point estimate in coefficient plot.\n")
+  } else {
+      warning("Could not find standard columns for estimates and CIs (Mean/Median, 2.5%, 97.5%). Plot might be incorrect.")
+      # Add placeholder columns if needed, or stop
+      coef_df$Estimate <- NA
+      coef_df$LowerCI <- NA
+      coef_df$UpperCI <- NA
+  }
+
+  # Ensure CIs are numeric
+  coef_df$LowerCI <- as.numeric(coef_df$LowerCI)
+  coef_df$UpperCI <- as.numeric(coef_df$UpperCI)
+  coef_df$Estimate <- as.numeric(coef_df$Estimate)
+
+  # Create the coefficient plot
+  coef_plot <- ggplot(coef_df, aes(x = Estimate, y = reorder(Parameter, Estimate))) +
+    geom_pointrange(aes(xmin = LowerCI, xmax = UpperCI)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      title = "CARBayes Model Coefficients",
+      subtitle = "Posterior Mean/Median and 95% Credible Intervals",
+      x = "Coefficient Estimate",
+      y = "Parameter"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 8), # Adjust text size if needed
+      plot.background = element_rect(fill = "white", color = NA) # Ensure white background, remove border
+      ) 
+
+  # Print the plot
+  print(coef_plot)
+
+  # Optional: Save the plot
+  ggsave("coefficient_plot.png", plot = coef_plot, width = 8, height = max(4, nrow(coef_df) * 0.3), units = "in", dpi = 300)
+  cat("Saved coefficient plot to coefficient_plot.png\n")
+
+} else {
+  cat("Skipping coefficient plot because model results or summary are unavailable.\n")
+}
+# --- End of Coefficient Visualization Code ---
 
 cat("\n--- Script Finished ---\n")
