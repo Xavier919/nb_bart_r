@@ -1,3 +1,6 @@
+
+
+library(spdep)
 library(dplyr)
 library(ggplot2)
 library(Matrix)
@@ -11,15 +14,11 @@ library(conflicted)
 library(readr)
 library(Metrics)
 library(tidyr)
+library(spatialreg)
+library(spgwr)
 library(sp)
 library(sf)
 library(mapview)
-library(tmap)
-
-# Install viridis package if not already installed
-if (!requireNamespace("viridis", quietly = TRUE)) {
-  install.packages("viridis")
-}
 
 conflict_prefer("select", "dplyr")
 
@@ -127,7 +126,50 @@ select_features_with_lasso <- function(X, y, max_features = 30) {
   return(names(selected_features))
 }
 
-# First, we'll add the R6 class definition for carbayes_model (similar to main.r)
+make_spatial_weights_for_sem <- function(sp_data, k) {
+  id <- row.names(as(sp_data, "data.frame"))
+  neighbours <- knn2nb(knearneigh(coordinates(sp_data), k = k), row.names = id)
+  listw <- nb2listw(neighbours, style = "B")
+  return(listw)
+}
+
+create_contiguity_weights <- function(data) {
+  # Extract coordinates
+  coords <- as.matrix(data[, c('x', 'y')])
+  
+  # Check for duplicate coordinates
+  if(anyDuplicated(coords)) {
+    # Add small jitter to duplicate points
+    set.seed(123)  # For reproducibility
+    jitter_amount <- 0.0001  # Very small jitter
+    
+    # Find duplicated rows
+    dup_indices <- which(duplicated(coords) | duplicated(coords, fromLast = TRUE))
+    
+    # Add jitter only to duplicated points
+    if(length(dup_indices) > 0) {
+      coords[dup_indices, 'x'] <- coords[dup_indices, 'x'] + runif(length(dup_indices), -jitter_amount, jitter_amount)
+      coords[dup_indices, 'y'] <- coords[dup_indices, 'y'] + runif(length(dup_indices), -jitter_amount, jitter_amount)
+    }
+  }
+  
+  # Convert to spatial points
+  sp_points <- SpatialPoints(coords)
+  
+  # Create Delaunay triangulation to approximate contiguity
+  tri <- tri2nb(sp_points)
+  
+  # Convert to binary weights matrix
+  W_list <- nb2listw(tri, style="B", zero.policy=TRUE)
+  W_sparse <- as(W_list, "CsparseMatrix")
+  W <- as.matrix(W_sparse)
+  
+  # Ensure symmetry
+  W_symmetric <- (W + t(W)) / 2
+  
+  return(W_symmetric)
+}
+
 carbayes_model <- R6::R6Class(
   "carbayes_model",
   
@@ -144,19 +186,61 @@ carbayes_model <- R6::R6Class(
     data_with_re = NULL,
     
     initialize = function(data = NULL, formula = NULL, random_effect = NULL, 
-                         exposure = NULL, spatial_vars = NULL) {
+                          exposure = NULL, spatial_vars = NULL) {
       self$data <- data
       self$formula <- formula
       self$random_effect <- random_effect
-      self$exposure <- exposure
+      self$exposure <- NULL
       self$spatial_vars <- spatial_vars
+    },
+    
+    create_W_list = function(W) {
+      n <- nrow(W)
+      W_list <- list()
+      W_list$n <- n
+      
+      W_list$adj <- vector("list", n)
+      W_list$weights <- vector("list", n)
+      W_list$num <- numeric(n)
+      
+      chunk_size <- 100
+      n_chunks <- ceiling(n / chunk_size)
+      
+      for (chunk in 1:n_chunks) {
+        start_idx <- (chunk - 1) * chunk_size + 1
+        end_idx <- min(chunk * chunk_size, n)
+        
+        for (i in start_idx:end_idx) {
+          neighbors <- which(W[i, ] > 0)
+          W_list$adj[[i]] <- neighbors
+          W_list$weights[[i]] <- W[i, neighbors]
+          W_list$num[i] <- length(neighbors)
+        }
+        
+        gc()
+      }
+      
+      W_list$sumjk <- sum(W_list$num)
+      return(W_list)
     },
     
     fit = function() {
       data_to_use <- self$data
       
       if (is.null(self$W)) {
-        self$W <- create_spatial_weights(data_to_use[, self$spatial_vars])
+        # Use contiguity weights instead of KNN
+        self$W <- create_contiguity_weights(data_to_use[, self$spatial_vars])
+      }
+      
+      options(expressions = 500000)
+      # Only run memory.limit on Windows
+      if (.Platform$OS.type == "windows") {
+        memory.limit(size = 1000000)
+      }
+      
+      if (mean(self$W > 0) > 0.1) {
+        threshold <- quantile(self$W[self$W > 0], 0.5)
+        self$W[self$W < threshold] <- 0
       }
       
       self$W_list <- self$create_W_list(self$W)
@@ -169,6 +253,7 @@ carbayes_model <- R6::R6Class(
         if (!is.factor(data_to_use[[self$random_effect]])) {
           data_to_use[[self$random_effect]] <- as.factor(data_to_use[[self$random_effect]])
         }
+        
         predictors <- paste(predictors, "+", self$random_effect)
       }
       
@@ -179,8 +264,8 @@ carbayes_model <- R6::R6Class(
         family = "poisson",  
         data = data_to_use,
         W = self$W,
-        burnin = 2000,
-        n.sample = 5000,
+        burnin = 1000,
+        n.sample = 2000,
         thin = 2,
         rho = 0.8,
         verbose = TRUE
@@ -250,406 +335,425 @@ carbayes_model <- R6::R6Class(
       return(lambda)
     },
     
-    create_W_list = function(W) {
-      n <- nrow(W)
-      W_list <- list()
-      W_list$n <- n
-      
-      W_list$adj <- vector("list", n)
-      W_list$weights <- vector("list", n)
-      W_list$num <- numeric(n)
-      
-      for (i in 1:n) {
-        neighbors <- which(W[i, ] > 0)
-        W_list$adj[[i]] <- neighbors
-        W_list$weights[[i]] <- W[i, neighbors]
-        W_list$num[i] <- length(neighbors)
+    summary = function() {
+      if (is.null(self$results)) {
+        return(NULL)
       }
       
-      W_list$sumjk <- sum(W_list$num)
-      return(W_list)
+      y_true <- as.numeric(self$data[[strsplit(self$formula, "~")[[1]][1]]])
+      y_pred <- as.numeric(self$predict())
+      
+      mae <- mean(abs(y_true - y_pred), na.rm = TRUE)
+      rmse <- sqrt(mean((y_true - y_pred)^2, na.rm = TRUE))
+      
+      return(list(mae = mae, rmse = rmse))
     }
   )
 )
 
-# Then modify the run_car_leroux_analysis function to use this class
-run_car_leroux_analysis <- function(k_neighbors = 5, max_features = 15) {
-  # Load and prepare data
-  data <- load_and_prepare_data()
+# Function to train the SEM Poisson model
+train_poisson_sem <- function(formula, train_data, val_data, global_weights, fold_weights) {
+  # Step 1: Fit a standard Poisson model first
+  poisson_model <- glm(formula, data = train_data, family = poisson(link = "log"))
   
-  # Create train-test split
-  set.seed(42)
-  train_idx <- createDataPartition(data$acc, p = 0.8, list = FALSE)
-  train_data <- data[train_idx, ]
-  test_data <- data[-train_idx, ]
+  # Step 2: Extract residuals (deviance residuals work well)
+  residuals <- residuals(poisson_model, type = "deviance")
   
-  # Select features using LASSO
-  feature_cols <- names(train_data)[!names(train_data) %in% c('int_no', 'acc', 'pi', 'borough', 'x', 'y')]
-  X_train <- train_data[, feature_cols]
-  y_train <- train_data$acc
+  # Step 3: Fit spatial error model to the residuals
+  train_data$residuals <- residuals
+  sem_residuals <- errorsarlm(as.formula("residuals ~ 1"), data = train_data, listw = fold_weights)
   
-  selected_features <- select_features_with_lasso(X_train, y_train, max_features = max_features)
-  print("Selected features:")
-  print(selected_features)
+  # Step 4: For prediction, combine both models
+  val_data <- data.frame(val_data)
+  poisson_predictions <- predict(poisson_model, newdata = val_data, type = "response")
   
-  # Create formula for the model
-  formula_str <- paste("acc ~", paste(selected_features, collapse = " + "))
-  
-  # Create and fit the CARBayes model
-  carbayes <- carbayes_model$new(
-    data = train_data,
-    formula = formula_str,
-    random_effect = "borough",
-    spatial_vars = c('x', 'y')
-  )
-  
-  cat("Fitting CARleroux model...\n")
-  model_results <- carbayes$fit()
-  
-  # Make predictions on train and test data
-  train_predictions <- carbayes$predict(train_data)
-  test_predictions <- carbayes$predict(test_data)
-  
-  # Evaluate performance
-  train_metrics <- list(
-    mae = mean(abs(train_data$acc - train_predictions)),
-    mse = mean((train_data$acc - train_predictions)^2),
-    rmse = sqrt(mean((train_data$acc - train_predictions)^2))
-  )
-  
-  test_metrics <- list(
-    mae = mean(abs(test_data$acc - test_predictions)),
-    mse = mean((test_data$acc - test_predictions)^2),
-    rmse = sqrt(mean((test_data$acc - test_predictions)^2))
-  )
-  
-  # Create plots
-  plot_data <- data.frame(
-    Observed = test_data$acc,
-    Fitted = test_predictions
-  )
-  
-  p <- ggplot(plot_data, aes(x = Observed, y = Fitted)) +
-    geom_point(alpha = 0.5) +
-    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
-    labs(title = "CARleroux Model: Observed vs. Fitted Values",
-         x = "Observed Accidents",
-         y = "Fitted Accidents") +
-    theme_minimal()
-  
-  print(p)
-  
-  return(list(
-    model = carbayes,
-    train_metrics = train_metrics,
-    test_metrics = test_metrics,
-    selected_features = selected_features,
-    test_predictions = test_predictions,
-    test_actual = test_data$acc
-  ))
+  residual_predictions <- predict(sem_residuals, newdata = val_data, listw = global_weights, 
+                                zero.policy = TRUE, type = "response")
+
+  # Apply adjustment (on log scale, then transform back)
+  adjusted_predictions <- poisson_predictions * exp(residual_predictions)
+  return(adjusted_predictions)
 }
 
-# Modified map_cv_predictions function to include observed accidents in output file and make dots bigger
-map_cv_predictions <- function(cv_results, original_data, folds, save_maps = TRUE) {
-  # Create a dataframe to store all test predictions
-  all_predictions <- data.frame()
-  
-  # Extract predictions from each fold
-  for (fold_idx in 1:length(cv_results)) {
-    fold_name <- paste0("fold_", fold_idx)
-    fold_results <- cv_results[[fold_name]]
-    
-    # Get indices for this fold's test data
-    test_indices <- folds[[fold_idx]]
-    
-    # Get test data for this fold
-    test_data <- original_data[test_indices, ]
-    
-    # Get fitted values - these are already in the original scale
-    fitted_values <- fold_results$test_predictions
-    
-    # Create a dataframe with predictions for this fold
-    fold_predictions <- data.frame(
-      int_no = test_data$int_no,
-      x = test_data$x,
-      y = test_data$y,
-      observed = test_data$acc,
-      predicted = fitted_values,
-      fold = fold_idx
-    )
-    
-    # Add to the collection of all predictions
-    all_predictions <- rbind(all_predictions, fold_predictions)
-  }
-  
-  # Recalculate error metrics directly
-  all_predictions$error <- all_predictions$observed - all_predictions$predicted
-  all_predictions$abs_error <- abs(all_predictions$error)
-  
-  # Print overall metrics for verification
-  total_mae <- mean(all_predictions$abs_error)
-  total_mse <- mean(all_predictions$error^2)
-  total_rmse <- sqrt(total_mse)
-  
-  cat("Overall metrics from all folds:\n")
-  cat(paste0("  MAE:  ", round(total_mae, 4), "\n"))
-  cat(paste0("  MSE:  ", round(total_mse, 4), "\n"))
-  cat(paste0("  RMSE: ", round(total_rmse, 4), "\n"))
-  
-  # Convert to sf object for mapping
-  predictions_sf <- st_as_sf(all_predictions, coords = c("x", "y"), crs = 32618)
-  
-  # Create only the predicted map with mapview - now with larger dots
-  map_predicted <- mapview(predictions_sf, zcol = "predicted", 
-                          layer.name = "Predicted Accidents",
-                          col.regions = viridis::plasma,
-                          legend = TRUE,
-                          cex = 5,  # Increased size for all dots (was 3)
-                          alpha.regions = 0.8)
-  
-  # Create a plot of observed vs predicted for all data
-  # Create a plot of observed vs predicted for all data
-  pred_vs_obs_plot <- ggplot(all_predictions, aes(x = observed, y = predicted)) +
-      geom_point(alpha = 0.5) +
-      geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
-      labs(title = "All Folds: Observed vs. Predicted Accidents",
-          x = "Observed Accidents",
-          y = "Predicted Accidents") +
-      theme_minimal() +
-      theme(
-        panel.background = element_rect(fill = "white"),
-        plot.background = element_rect(fill = "white")
-      )
-  
-  # Save maps and plots if requested
-  if (save_maps) {
-    # Create output directory if it doesn't exist
-    dir.create("output", showWarnings = FALSE)
-    
-    # Create the predictions data frame with intersection ID, observed and predicted accidents
-    simplified_predictions <- all_predictions[, c("int_no", "observed", "predicted")]
-    
-    # Sort by predicted accidents (descending)
-    simplified_predictions <- simplified_predictions[order(simplified_predictions$predicted, decreasing = TRUE), ]
-    
-    # Save the predictions data with observed column
-    write.csv(simplified_predictions, "output/accidents_predictions.csv", row.names = FALSE)
-    
-    # Convert the mapview objects to static plots using tmap
-    tmap_mode("plot")
-    
-    # Create modern tmap v4 compatible code for predicted accidents map
-    # With single legend and uniform but larger dot sizes
-    tmap_pred <- tmap::tm_shape(predictions_sf) + 
-      tmap::tm_dots(
-        fill = "predicted",                    # Color dots by predicted value 
-        fill.scale = tm_scale(                 # Use scale object for styling
-          values = "plasma",                   # Color palette
-          title = "Predicted Accidents"        # Legend title
-        ),
-        size = 0.2,                            # Increased fixed size for all dots (was 0.1)
-        fill_alpha = 0.8                       # Use fill_alpha instead of alpha
-      ) +
-      tm_layout(
-        legend.outside = TRUE,                 # Place legend outside
-        legend.outside.position = "right",     # Position on the right
-        legend.title.size = 1.2,               # Title size
-        legend.text.size = 0.8,                # Text size
-        frame = FALSE                          # No frame
-      )
-    
-    # Save the map
-    tmap::tmap_save(tmap_pred, filename = "output/predicted_accidents_map.png", width = 10, height = 8)
-    
-    # Save the observed vs. predicted plot
-    ggsave("output/observed_vs_predicted.png", pred_vs_obs_plot, width = 10, height = 8)
-    
-    cat("Map of predicted accidents saved to output/predicted_accidents_map.png\n")
-    cat("Accident predictions with observed and predicted values saved to output/accidents_predictions.csv\n")
-    cat("Observed vs. predicted plot saved to output/observed_vs_predicted.png\n")
-  }
-  
-  # Return only the predicted map and relevant data
-  return(list(
-    predictions = all_predictions,
-    predictions_sf = predictions_sf,
-    map_predicted = map_predicted,
-    pred_vs_obs_plot = pred_vs_obs_plot
-  ))
-}
-
-# Function to run cross-validation with CAR Leroux model
-run_car_leroux_cv <- function(k_neighbors = 5, max_features = 15, k_folds = 5) {
-  # Load and prepare data
-  data <- load_and_prepare_data()
-  
-  # Create folds for cross-validation
+# Combined cross-validation function for both models
+run_combined_cross_validation <- function(data, response_var = "acc", k = 5, random_effect = "borough", max_features = 30) {
   set.seed(42)
-  folds <- createFolds(data$acc, k = k_folds, list = TRUE, returnTrain = FALSE)
   
-  # Initialize storage for metrics
-  cv_results <- list()
-  all_metrics <- data.frame(
-    fold = integer(),
-    mae = numeric(),
-    mse = numeric(),
-    rmse = numeric(),
-    stringsAsFactors = FALSE
-  )
+  # Create folds using caret - same folds for both models
+  folds <- createFolds(data$acc, k = k, returnTrain = TRUE)
   
-  # Run k-fold cross-validation
-  for (fold_idx in 1:k_folds) {
-    cat(paste0("\n---------- FOLD ", fold_idx, " OF ", k_folds, " ----------\n"))
+  # Initialize results for both models
+  carbayes_fold_results <- list()
+  sem_fold_results <- list()
+  
+  carbayes_test_actual <- list()
+  carbayes_test_predicted <- list()
+  sem_test_actual <- list()
+  sem_test_predicted <- list()
+  
+  # Global spatial weights for SEM model
+  sp_data <- data
+  coordinates(sp_data) <- ~ x + y
+  w_global <- make_spatial_weights_for_sem(sp_data, k = 3)
+  
+  feature_formulas <- list()
+  
+  for (i in 1:k) {
+    cat(sprintf("\nProcessing fold %d of %d\n", i, k))
+    train_idx <- folds[[i]]
+    test_idx <- setdiff(1:nrow(data), train_idx)
     
-    # Split data into training and validation sets for this fold
-    test_indices <- folds[[fold_idx]]
-    train_indices <- setdiff(1:nrow(data), test_indices)
+    train_data <- data[train_idx, ]
+    test_data <- data[test_idx, ]
     
-    train_data <- data[train_indices, ]
-    test_data <- data[test_indices, ]
+    # Create spatial data for SEM model
+    train_sp <- sp_data[train_idx, ]
+    test_sp <- sp_data[test_idx, ]
     
-    # Select features using LASSO on this fold's training data
-    feature_cols <- names(train_data)[!names(train_data) %in% c('int_no', 'acc', 'pi', 'borough', 'x', 'y')]
+    # Create spatial weights for SEM model
+    w_train <- make_spatial_weights_for_sem(train_sp, k = 3)
+    
+    # Feature selection using LASSO from CARBayes file
+    exclude_cols <- c('int_no', 'acc', 'pi', 'borough', 'x', 'y')
+    feature_cols <- setdiff(colnames(train_data), exclude_cols)
     X_train <- train_data[, feature_cols]
-    y_train <- train_data$acc
+    y_train <- train_data[[response_var]]
     
-    selected_features <- select_features_with_lasso(X_train, y_train, max_features = max_features)
-    cat("Selected features for fold", fold_idx, ":\n")
-    print(selected_features)
+    selected_features <- select_features_with_lasso(X_train, y_train, max_features)
     
-    # Create formula for the model
-    formula_str <- paste("acc ~", paste(selected_features, collapse = " + "))
+    # Create formula for both models
+    formula_str <- paste(response_var, "~", paste(selected_features, collapse = " + "))
+    feature_formulas[[i]] <- formula_str
+    formula <- as.formula(formula_str)
     
-    # Create and fit the CARBayes model
+    # Train CARBayes model
     carbayes <- carbayes_model$new(
       data = train_data,
       formula = formula_str,
-      random_effect = "borough",
+      random_effect = random_effect,
+      exposure = NULL,
       spatial_vars = c('x', 'y')
     )
     
-    cat("Fitting CARleroux model for fold", fold_idx, "...\n")
-    model_results <- carbayes$fit()
+    carbayes_results <- carbayes$fit()
     
-    # Make predictions on train and test data
-    train_predictions <- carbayes$predict(train_data)
-    test_predictions <- carbayes$predict(test_data)
+    carbayes_train_preds <- carbayes$predict(train_data)
+    carbayes_test_preds <- carbayes$predict(test_data)
     
-    # Calculate metrics
-    train_mae <- mean(abs(train_data$acc - train_predictions))
-    train_mse <- mean((train_data$acc - train_predictions)^2)
-    train_rmse <- sqrt(train_mse)
+    # Calculate metrics for CARBayes
+    carbayes_train_mae <- mean(abs(train_data$acc - carbayes_train_preds), na.rm = TRUE)
+    carbayes_train_mse <- mean((train_data$acc - carbayes_train_preds)^2, na.rm = TRUE)
+    carbayes_train_rmse <- sqrt(carbayes_train_mse)
     
-    test_mae <- mean(abs(test_data$acc - test_predictions))
-    test_mse <- mean((test_data$acc - test_predictions)^2)
-    test_rmse <- sqrt(test_mse)
+    carbayes_test_mae <- mean(abs(test_data$acc - carbayes_test_preds), na.rm = TRUE)
+    carbayes_test_mse <- mean((test_data$acc - carbayes_test_preds)^2, na.rm = TRUE)
+    carbayes_test_rmse <- sqrt(carbayes_test_mse)
     
-    # Store metrics for this fold
-    fold_metrics <- data.frame(
-      fold = fold_idx,
-      mae = test_mae,
-      mse = test_mse,
-      rmse = test_rmse,
-      stringsAsFactors = FALSE
+    # Train SEM Poisson model (without borough as random effect)
+    sem_test_preds <- train_poisson_sem(
+      formula = formula, 
+      train_data = train_sp, 
+      val_data = test_sp, 
+      global_weights = w_global, 
+      fold_weights = w_train
     )
     
-    all_metrics <- rbind(all_metrics, fold_metrics)
+    # Calculate metrics for SEM Poisson
+    sem_test_mae <- mean(abs(test_data$acc - sem_test_preds), na.rm = TRUE)
+    sem_test_mse <- mean((test_data$acc - sem_test_preds)^2, na.rm = TRUE)
+    sem_test_rmse <- sqrt(sem_test_mse)
     
-    # Print metrics for this fold
-    cat(paste0("Fold ", fold_idx, " metrics:\n"))
-    cat(paste0("  MAE: ", round(test_mae, 4), "\n"))
-    cat(paste0("  MSE: ", round(test_mse, 4), "\n"))
-    cat(paste0("  RMSE: ", round(test_rmse, 4), "\n"))
-    
-    # Store the model and results
-    cv_results[[paste0("fold_", fold_idx)]] <- list(
+    # Store results
+    carbayes_fold_results[[i]] <- list(
+      fold = i,
+      train_mae = carbayes_train_mae,
+      train_mse = carbayes_train_mse,
+      train_rmse = carbayes_train_rmse,
+      test_mae = carbayes_test_mae,
+      test_mse = carbayes_test_mse,
+      test_rmse = carbayes_test_rmse,
       model = carbayes,
-      test_predictions = test_predictions,
       selected_features = selected_features,
-      metrics = fold_metrics
+      formula = formula_str
     )
     
-    # Create plot of observed vs. fitted values for this fold
-    plot_data <- data.frame(
-      Observed = test_data$acc,
-      Fitted = test_predictions
+    sem_fold_results[[i]] <- list(
+      fold = i,
+      test_mae = sem_test_mae,
+      test_mse = sem_test_mse,
+      test_rmse = sem_test_rmse,
+      selected_features = selected_features,
+      formula = formula_str
     )
     
-    p <- ggplot(plot_data, aes(x = Observed, y = Fitted)) +
-      geom_point(alpha = 0.5) +
-      geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
-      labs(title = paste0("Fold ", fold_idx, ": Observed vs. Fitted Values"),
-           x = "Observed Accidents",
-           y = "Fitted Accidents") +
-      theme_minimal() +
-      theme(
-        panel.background = element_rect(fill = "white"),
-        plot.background = element_rect(fill = "white")
-      )
-    
-    print(p)
+    carbayes_test_actual[[i]] <- test_data$acc
+    carbayes_test_predicted[[i]] <- carbayes_test_preds
+    sem_test_actual[[i]] <- test_data$acc
+    sem_test_predicted[[i]] <- sem_test_preds
   }
   
-  # Calculate and print average metrics across all folds
-  avg_metrics <- colMeans(all_metrics[, c("mae", "mse", "rmse")])
+  # Combine results
+  carbayes_test_actual_combined <- unlist(carbayes_test_actual)
+  carbayes_test_predicted_combined <- unlist(carbayes_test_predicted)
+  sem_test_actual_combined <- unlist(sem_test_actual)
+  sem_test_predicted_combined <- unlist(sem_test_predicted)
   
-  cat("\n---------- CROSS-VALIDATION SUMMARY ----------\n")
-  cat("Average metrics across all folds:\n")
-  cat(paste0("  MAE:  ", round(avg_metrics["mae"], 4), "\n"))
-  cat(paste0("  MSE:  ", round(avg_metrics["mse"], 4), "\n"))
-  cat(paste0("  RMSE: ", round(avg_metrics["rmse"], 4), "\n"))
+  # Calculate overall metrics for CARBayes
+  carbayes_overall_mae <- mean(abs(carbayes_test_actual_combined - carbayes_test_predicted_combined), na.rm = TRUE)
+  carbayes_overall_mse <- mean((carbayes_test_actual_combined - carbayes_test_predicted_combined)^2, na.rm = TRUE)
+  carbayes_overall_rmse <- sqrt(carbayes_overall_mse)
   
-  # Print metrics for each fold in a table format
-  print(all_metrics)
+  # Calculate overall metrics for SEM Poisson
+  sem_overall_mae <- mean(abs(sem_test_actual_combined - sem_test_predicted_combined), na.rm = TRUE)
+  sem_overall_mse <- mean((sem_test_actual_combined - sem_test_predicted_combined)^2, na.rm = TRUE)
+  sem_overall_rmse <- sqrt(sem_overall_mse)
   
-  # After the cross-validation loop, add this code:
-  cat("\n---------- TOP PREDICTIONS BY FOLD ----------\n")
-  for (fold_idx in 1:k_folds) {
-    # Get the fold data
-    fold_name <- paste0("fold_", fold_idx)
-    fold_results <- cv_results[[fold_name]]
-    
-    # Get test indices for this fold
-    test_indices <- folds[[fold_idx]]
-    test_data <- data[test_indices, ]
-    
-    # Get fitted values
-    fitted_values <- fold_results$test_predictions
-    observed_values <- test_data$acc
-    
-    # Create a data frame with observed and predicted values
-    comparison <- data.frame(
-      intersection = test_data$int_no,
-      observed = observed_values,
-      predicted = fitted_values
-    )
-    
-    # Sort by predicted values (descending)
-    top_predictions <- comparison[order(comparison$predicted, decreasing = TRUE), ]
-    
-    # Print the top 10 predictions
-    cat(paste0("\nTop 10 predicted values for fold ", fold_idx, ":\n"))
-    print(head(top_predictions, 10))
-  }
+  # Feature consistency analysis
+  all_features <- unique(unlist(lapply(carbayes_fold_results, function(x) x$selected_features)))
+  feature_counts <- sapply(all_features, function(feat) {
+    sum(sapply(carbayes_fold_results, function(x) feat %in% x$selected_features))
+  })
   
-  # Return the list including the folds
+  feature_consistency <- data.frame(
+    Feature = names(feature_counts),
+    Count = feature_counts,
+    Percentage = 100 * feature_counts / k
+  )
+  feature_consistency <- feature_consistency[order(feature_consistency$Count, decreasing = TRUE), ]
+  
   return(list(
-    cv_results = cv_results,
-    all_metrics = all_metrics,
-    avg_metrics = avg_metrics,
-    folds = folds,
-    data = data
+    carbayes_results = list(
+      fold_results = carbayes_fold_results,
+      overall_mae = carbayes_overall_mae,
+      overall_mse = carbayes_overall_mse,
+      overall_rmse = carbayes_overall_rmse,
+      test_actual = carbayes_test_actual_combined,
+      test_predicted = carbayes_test_predicted_combined
+    ),
+    sem_results = list(
+      fold_results = sem_fold_results,
+      overall_mae = sem_overall_mae,
+      overall_mse = sem_overall_mse,
+      overall_rmse = sem_overall_rmse,
+      test_actual = sem_test_actual_combined,
+      test_predicted = sem_test_predicted_combined
+    ),
+    feature_consistency = feature_consistency,
+    feature_formulas = feature_formulas
   ))
 }
 
-# Run cross-validation with modified function
-results_cv <- run_car_leroux_cv(k_neighbors = 5, max_features = 15, k_folds = 5)
+# Generate figures from cross-validation results
+generate_cv_figures <- function(cv_results, data) {
+  # Figure 1: Map of predicted accidents
+  # Create a data frame to store all predictions
+  all_predictions <- data.frame(
+    x = data$x,
+    y = data$y,
+    actual = data$acc,
+    predicted = NA
+  )
+  
+  # Get all test predictions from cross-validation results
+  test_actual_combined <- cv_results$carbayes_results$test_actual
+  test_predicted_combined <- cv_results$carbayes_results$test_predicted
+  
+  # Create a more robust way to match predictions back to original data
+  # First, collect all test indices from each fold
+  all_test_indices <- list()
+  for (i in 1:length(cv_results$carbayes_results$fold_results)) {
+    # Recreate the fold indices
+    set.seed(42)
+    folds <- createFolds(data$acc, k = length(cv_results$carbayes_results$fold_results), returnTrain = TRUE)
+    train_idx <- folds[[i]]
+    test_idx <- setdiff(1:nrow(data), train_idx)
+    all_test_indices[[i]] <- test_idx
+  }
+  
+  # Now assign predictions to the correct indices
+  start_idx <- 1
+  for (i in 1:length(all_test_indices)) {
+    test_idx <- all_test_indices[[i]]
+    end_idx <- start_idx + length(test_idx) - 1
+    
+    # Make sure we don't go beyond the available predictions
+    if (end_idx <= length(test_predicted_combined)) {
+      fold_predictions <- test_predicted_combined[start_idx:end_idx]
+      all_predictions$predicted[test_idx] <- fold_predictions
+      start_idx <- end_idx + 1
+    }
+  }
+  
+  # Remove any rows with NA predictions
+  all_predictions <- all_predictions[!is.na(all_predictions$predicted), ]
+  
+  # Create spatial points data frame for mapping
+  sp_predictions <- all_predictions
+  coordinates(sp_predictions) <- ~ x + y
+  
+  # Convert to sf for better mapping
+  sf_predictions <- st_as_sf(sp_predictions)
+  
+  # Create map of predicted accidents
+  map_plot <- ggplot() +
+    geom_sf(data = sf_predictions, aes(color = predicted), size = 1) +
+    scale_color_viridis_c(name = "Predicted\nAccidents") +
+    theme_classic() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA),
+      legend.position = "right"
+    ) +
+    labs(title = "Map of Predicted Accidents",
+         subtitle = "CARBayes Model Cross-Validation Results")
+  
+  # Figure 2: Predicted vs Actual values
+  scatter_plot <- ggplot(all_predictions, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.5) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    geom_smooth(method = "lm", color = "blue", se = TRUE) +
+    theme_classic() +
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA)
+    ) +
+    labs(title = "Predicted vs Actual Accidents",
+         subtitle = "CARBayes Model Cross-Validation Results",
+         x = "Actual Accidents",
+         y = "Predicted Accidents")
+  
+  # Calculate correlation
+  correlation <- cor(all_predictions$actual, all_predictions$predicted)
+  cat(sprintf("\nCorrelation between actual and predicted values: %.4f\n", correlation))
+  
+  return(list(map_plot = map_plot, scatter_plot = scatter_plot, predictions = all_predictions))
+}
 
-# Generate maps of predictions and save them
-prediction_maps <- map_cv_predictions(results_cv$cv_results, results_cv$data, results_cv$folds, save_maps = TRUE)
+# Main execution
+cat("Loading and preparing data...\n")
+full_data <- load_and_prepare_data()
 
-# Display the predicted map
-prediction_maps$map_predicted
+cat("Running combined cross-validation...\n")
+cv_results <- run_combined_cross_validation(
+  data = full_data, 
+  response_var = "acc",
+  k = 5,
+  random_effect = "borough",
+  max_features = 30
+)
 
-# Display the observed vs predicted plot
-print(prediction_maps$pred_vs_obs_plot)
+# Print Results
+cat("\n==== CARBayes Model Results ====\n")
+cat("Metrics by fold:\n")
+for (i in 1:length(cv_results$carbayes_results$fold_results)) {
+  fold <- cv_results$carbayes_results$fold_results[[i]]
+  cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n", 
+              i, fold$test_mae, fold$test_mse, fold$test_rmse))
+}
+
+carbayes_mean_mae <- mean(sapply(cv_results$carbayes_results$fold_results, function(x) x$test_mae))
+carbayes_mean_mse <- mean(sapply(cv_results$carbayes_results$fold_results, function(x) x$test_mse))
+carbayes_mean_rmse <- mean(sapply(cv_results$carbayes_results$fold_results, function(x) x$test_rmse))
+
+cat("\nCARBayes Mean performance across folds:\n")
+cat(sprintf("Mean MAE: %.4f\n", carbayes_mean_mae))
+cat(sprintf("Mean MSE: %.4f\n", carbayes_mean_mse))
+cat(sprintf("Mean RMSE: %.4f\n", carbayes_mean_rmse))
+cat(sprintf("Overall MAE: %.4f\n", cv_results$carbayes_results$overall_mae))
+cat(sprintf("Overall MSE: %.4f\n", cv_results$carbayes_results$overall_mse))
+cat(sprintf("Overall RMSE: %.4f\n", cv_results$carbayes_results$overall_rmse))
+
+cat("\n==== SEM Poisson Model Results ====\n")
+cat("Metrics by fold:\n")
+for (i in 1:length(cv_results$sem_results$fold_results)) {
+  fold <- cv_results$sem_results$fold_results[[i]]
+  cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n", 
+              i, fold$test_mae, fold$test_mse, fold$test_rmse))
+}
+
+sem_mean_mae <- mean(sapply(cv_results$sem_results$fold_results, function(x) x$test_mae))
+sem_mean_mse <- mean(sapply(cv_results$sem_results$fold_results, function(x) x$test_mse))
+sem_mean_rmse <- mean(sapply(cv_results$sem_results$fold_results, function(x) x$test_rmse))
+
+cat("\nSEM Poisson Mean performance across folds:\n")
+cat(sprintf("Mean MAE: %.4f\n", sem_mean_mae))
+cat(sprintf("Mean MSE: %.4f\n", sem_mean_mse))
+cat(sprintf("Mean RMSE: %.4f\n", sem_mean_rmse))
+cat(sprintf("Overall MAE: %.4f\n", cv_results$sem_results$overall_mae))
+cat(sprintf("Overall MSE: %.4f\n", cv_results$sem_results$overall_mse))
+cat(sprintf("Overall RMSE: %.4f\n", cv_results$sem_results$overall_rmse))
+
+# Compare the models
+cat("\n==== Model Comparison ====\n")
+comparison_df <- data.frame(
+  Model = c("CARBayes", "SEM Poisson"),
+  Mean_MAE = c(carbayes_mean_mae, sem_mean_mae),
+  Mean_MSE = c(carbayes_mean_mse, sem_mean_mse),
+  Mean_RMSE = c(carbayes_mean_rmse, sem_mean_rmse),
+  Overall_MAE = c(cv_results$carbayes_results$overall_mae, cv_results$sem_results$overall_mae),
+  Overall_MSE = c(cv_results$carbayes_results$overall_mse, cv_results$sem_results$overall_mse),
+  Overall_RMSE = c(cv_results$carbayes_results$overall_rmse, cv_results$sem_results$overall_rmse)
+)
+
+print(comparison_df)
+
+# After running cross-validation, generate and display the figures
+cat("\nGenerating figures from cross-validation results...\n")
+figures <- generate_cv_figures(cv_results, full_data)
+
+# Save the figures
+ggsave("predicted_accidents_map.png", figures$map_plot, width = 10, height = 8)
+ggsave("predicted_vs_actual.png", figures$scatter_plot, width = 8, height = 6)
+
+cat("\nFigures saved as 'predicted_accidents_map.png' and 'predicted_vs_actual.png'\n")
+
+# Display summary statistics of predictions
+cat("\nSummary of predictions:\n")
+print(summary(figures$predictions$predicted))
+print(summary(figures$predictions$actual))
+
+# Calculate additional metrics
+cat("\nAdditional metrics:\n")
+cat(sprintf("Correlation: %.4f\n", cor(figures$predictions$actual, figures$predictions$predicted)))
+cat(sprintf("R-squared: %.4f\n", cor(figures$predictions$actual, figures$predictions$predicted)^2))
+
+# Fit CARBayes model on the whole dataset
+cat("\nFitting CARBayes model on the whole dataset...\n")
+
+# Use the most common features from cross-validation
+top_features <- cv_results$feature_consistency$Feature[cv_results$feature_consistency$Percentage >= 60]
+if (length(top_features) < 5) {
+  top_features <- cv_results$feature_consistency$Feature[1:min(5, nrow(cv_results$feature_consistency))]
+}
+
+final_formula <- paste("acc ~", paste(top_features, collapse = " + "))
+cat(sprintf("Using formula: %s\n", final_formula))
+
+final_carbayes <- carbayes_model$new(
+  data = full_data,
+  formula = final_formula,
+  random_effect = "borough",
+  exposure = NULL,
+  spatial_vars = c('x', 'y')
+)
+
+final_results <- final_carbayes$fit()
+
+# Calculate model fit statistics
+cat("\nModel fit statistics:\n")
+cat(sprintf("DIC: %.4f\n", final_results$DIC))
+cat(sprintf("pD: %.4f\n", final_results$pd))
+
+# Calculate predictions on the full dataset
+final_predictions <- final_carbayes$predict(full_data)
+final_mae <- mean(abs(full_data$acc - final_predictions), na.rm = TRUE)
+final_rmse <- sqrt(mean((full_data$acc - final_predictions)^2, na.rm = TRUE))
+final_correlation <- cor(full_data$acc, final_predictions)
+
+cat("\nFinal model performance on full dataset:\n")
+cat(sprintf("MAE: %.4f\n", final_mae))
+cat(sprintf("RMSE: %.4f\n", final_rmse))
+cat(sprintf("Correlation: %.4f\n", final_correlation))
+cat(sprintf("R-squared: %.4f\n", final_correlation^2))
