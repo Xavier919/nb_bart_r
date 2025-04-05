@@ -525,4 +525,127 @@ if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_results) && !i
 }
 # --- End of Coefficient Visualization Code ---
 
+# --- Add Prediction, Residual, and Phi Data ---
+cat("\n--- Calculating Predictions and Residuals ---\n")
+
+predictions <- NULL
+residuals <- NULL
+phi_mean <- NULL
+
+# Check if model fitting was successful and results are available
+if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_final) && !is.null(carbayes_results)) {
+  
+  # Predict using the fitted model on the original data
+  predictions <- tryCatch({
+    carbayes_final$predict() 
+  }, error = function(e) {
+    cat("Error during prediction: ", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(predictions) && length(predictions) == nrow(full_data)) {
+    full_data$predictions <- predictions
+    full_data$residuals <- full_data[[response_var]] - full_data$predictions
+    cat("Predictions and residuals calculated.\n")
+  } else {
+    cat("Skipping residual calculation due to prediction issues or length mismatch.\n")
+    predictions <- NULL # Ensure it's null if failed
+  }
+  
+  # Extract mean spatial random effects (phi)
+  if (!is.null(carbayes_results$samples$phi)) {
+    phi_samples <- carbayes_results$samples$phi
+    if (ncol(phi_samples) == nrow(full_data)) {
+      phi_mean <- apply(phi_samples, 2, mean)
+      full_data$phi_mean <- phi_mean
+      cat("Mean spatial random effects (phi) extracted.\n")
+    } else {
+      cat("Mismatch between number of phi samples columns and data rows. Skipping phi map.\n")
+    }
+  } else {
+    cat("Spatial random effects (phi) not found in model results. Skipping phi map.\n")
+  }
+  
+} else {
+  cat("Skipping prediction, residual, and phi calculations because model fitting failed.\n")
+}
+# --- End of Data Calculation ---
+
+
+# --- Add Residual Map Visualization Code Here ---
+cat("\n--- Generating Residual Map ---\n")
+
+# Check if residuals were calculated successfully
+if (!is.null(predictions) && "residuals" %in% colnames(full_data)) {
+
+  coords_res <- full_data[, c("int_no", "x", "y", "residuals")]
+
+  # Determine symmetric range for color scale if possible
+  max_abs_res <- max(abs(coords_res$residuals), na.rm = TRUE)
+
+  res_plot <- ggplot(coords_res, aes(x = x, y = y, color = residuals)) +
+    geom_point(size = 1) +
+    # Use a diverging color scale centered at 0
+    scale_color_gradient2(
+        low = "blue", mid = "white", high = "red", 
+        midpoint = 0, 
+        limit = c(-max_abs_res, max_abs_res), # Symmetrize the scale
+        name = "Residuals\n(Observed - Fitted)"
+    ) +
+    labs(
+      title = "Map of Model Residuals",
+      subtitle = "Highlights areas of over-prediction (blue) and under-prediction (red)",
+      x = "X Coordinate",
+      y = "Y Coordinate"
+    ) +
+    theme_minimal() +
+    theme(
+      aspect.ratio = 1,
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+
+  print(res_plot)
+  ggsave("residual_map.png", plot = res_plot, width = 10, height = 10, units = "in", dpi = 300)
+  cat("Saved residual map to residual_map.png\n")
+
+} else {
+  cat("Skipping residual map because predictions or residuals are unavailable.\n")
+}
+# --- End of Residual Map Visualization Code ---
+
+
+# --- Add Phi Map Visualization Code Here ---
+cat("\n--- Generating Spatial Random Effects (Phi) Map ---\n")
+
+# Check if phi_mean was calculated successfully
+if (!is.null(phi_mean) && "phi_mean" %in% colnames(full_data)) {
+
+  coords_phi <- full_data[, c("int_no", "x", "y", "phi_mean")]
+
+  phi_plot <- ggplot(coords_phi, aes(x = x, y = y, color = phi_mean)) +
+    geom_point(size = 1) +
+    # Use a continuous color scale like viridis
+    scale_color_viridis_c(option = "viridis", name = "Mean Spatial\nEffect (Phi)") +
+    labs(
+      title = "Map of Spatial Random Effects (Posterior Mean Phi)",
+      subtitle = "Shows underlying spatial pattern after accounting for covariates",
+      x = "X Coordinate",
+      y = "Y Coordinate"
+    ) +
+    theme_minimal() +
+    theme(
+      aspect.ratio = 1,
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+
+  print(phi_plot)
+  ggsave("phi_map.png", plot = phi_plot, width = 10, height = 10, units = "in", dpi = 300)
+  cat("Saved phi map to phi_map.png\n")
+
+} else {
+  cat("Skipping phi map because spatial random effects (phi) are unavailable.\n")
+}
+# --- End of Phi Map Visualization Code ---
+
+
 cat("\n--- Script Finished ---\n")
