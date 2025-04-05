@@ -7,6 +7,8 @@ library(R6)
 library(CARBayes)
 library(conflicted)
 library(readr)
+library(ggplot2)
+library(reshape2)
 
 conflict_prefer("select", "dplyr")
 
@@ -370,7 +372,7 @@ carbayes_final <- carbayes_model$new(
   spatial_vars = c('x', 'y')
 )
 
-carbayes_results <- try(carbayes_final$fit(burnin = 1000, n_sample = 2500, thin = 5), silent = FALSE)
+carbayes_results <- try(carbayes_final$fit(burnin = 2000, n_sample = 5000, thin = 2), silent = FALSE)
 
 if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_results)) {
   cat("\n==== CARBayes Model Summary ====\n")
@@ -386,5 +388,74 @@ if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_results)) {
 } else {
   cat("\nCARBayes model fitting failed. No results to display.\n")
 }
+
+# --- Add Visualization Code Here ---
+
+cat("\n--- Generating Spatial Weights Visualization ---\n")
+
+# Check if the model and W matrix exist
+if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_final) && !is.null(carbayes_final$W)) {
+
+  W_matrix <- carbayes_final$W
+  coords <- full_data[, c("int_no", "x", "y")] # Assuming 'int_no' is a unique identifier
+
+  # Ensure W_matrix has row/column names matching coordinates if possible
+  # If W matrix rows/cols don't correspond directly to coords rows, adjust accordingly.
+  # Here, we assume the i-th row/col in W corresponds to the i-th row in coords.
+  if (nrow(W_matrix) == nrow(coords)) {
+    rownames(W_matrix) <- coords$int_no
+    colnames(W_matrix) <- coords$int_no
+  } else {
+      warning("Mismatch between W matrix dimensions and coordinate rows. Visualization might be incorrect.")
+      # Add handling if needed, e.g., subsetting coords or stopping
+  }
+
+  # Convert W matrix to a long format data frame for links
+  W_df <- melt(as.matrix(W_matrix), varnames = c("from_int", "to_int"), value.name = "weight")
+
+  # Filter out zero weights (no direct link in the k-NN graph) and self-loops
+  links <- W_df[W_df$weight > 0 & W_df$from_int != W_df$to_int, ]
+
+  # Merge with coordinates to get start and end points for segments
+  links <- merge(links, coords, by.x = "from_int", by.y = "int_no")
+  names(links)[names(links) == "x"] <- "x_start"
+  names(links)[names(links) == "y"] <- "y_start"
+
+  links <- merge(links, coords, by.x = "to_int", by.y = "int_no")
+  names(links)[names(links) == "x"] <- "x_end"
+  names(links)[names(links) == "y"] <- "y_end"
+
+  # Create the plot
+  p <- ggplot() +
+    # Draw the links (segments) between intersections
+    # Color intensity represents the weight (inverse distance) - higher is stronger/closer
+    geom_segment(data = links, aes(x = x_start, y = y_start, xend = x_end, yend = y_end, color = weight), alpha = 0.5) +
+    # Draw the intersections (points)
+    geom_point(data = coords, aes(x = x, y = y), size = 1, color = "black") +
+    # Use a color scale appropriate for continuous weights
+    scale_color_viridis_c(option = "plasma", name = "Spatial Weight\n(Inverse Distance)") +
+    # Add titles and labels
+    labs(title = "Intersection Map with Spatial Links",
+         subtitle = paste("Links based on k=3 nearest neighbors (inverse distance weighted)"), # Use the known k value
+         x = "X Coordinate",
+         y = "Y Coordinate") +
+    # Use a minimal theme and set background to white
+    theme_minimal() +
+    theme(
+      aspect.ratio = 1, # Maintain aspect ratio for spatial accuracy
+      plot.background = element_rect(fill = "white", color = NA) # Set background to white, remove border
+      ) 
+
+  # Print the plot
+  print(p)
+  
+  # Optional: Save the plot
+  ggsave("intersection_links_map.png", plot = p, width = 10, height = 10, units = "in", dpi = 300)
+  cat("Saved map to intersection_links_map.png\n")
+
+} else {
+  cat("Skipping visualization because model fitting failed or W matrix is unavailable.\n")
+}
+# --- End of Visualization Code ---
 
 cat("\n--- Script Finished ---\n")
