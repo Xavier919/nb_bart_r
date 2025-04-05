@@ -226,9 +226,9 @@ carbayes_model <- R6::R6Class(
         family = "poisson",  
         data = data_to_use,
         W = self$W,
-        burnin = 2000,
-        n.sample = 5000,
-        thin = 2,
+        burnin = 5000,
+        n.sample = 10000,
+        thin = 5,
         #rho = 0.8,
         verbose = TRUE
       )

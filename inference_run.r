@@ -372,7 +372,7 @@ carbayes_final <- carbayes_model$new(
   spatial_vars = c('x', 'y')
 )
 
-carbayes_results <- try(carbayes_final$fit(burnin = 2000, n_sample = 5000, thin = 2), silent = FALSE)
+carbayes_results <- try(carbayes_final$fit(burnin = 5000, n_sample = 10000, thin = 2), silent = FALSE)
 
 if (!inherits(carbayes_results, "try-error") && !is.null(carbayes_results)) {
   cat("\n==== CARBayes Model Summary ====\n")
@@ -646,6 +646,170 @@ if (!is.null(phi_mean) && "phi_mean" %in% colnames(full_data)) {
   cat("Skipping phi map because spatial random effects (phi) are unavailable.\n")
 }
 # --- End of Phi Map Visualization Code ---
+
+# --- Add Observed vs Fitted Plot ---
+cat("\n--- Generating Observed vs. Fitted Plot ---\n")
+
+# Check if predictions and the response variable column exist
+if (!is.null(predictions) && "predictions" %in% colnames(full_data) && response_var %in% colnames(full_data)) {
+
+  # Select only the necessary columns for this plot to avoid potential duplicate name errors
+  plot_data_obsfit <- full_data[, c(response_var, "predictions")]
+  
+  # Check if column names are unique within the selected data
+  if(any(duplicated(names(plot_data_obsfit)))){
+      warning("Duplicate column names detected for Observed vs. Fitted plot. Plotting might fail.")
+      # Attempt to fix simple cases, e.g. if response_var == "predictions"
+      # This is a basic fix; more complex duplication might need manual intervention
+      colnames(plot_data_obsfit) <- make.unique(colnames(plot_data_obsfit))
+      warning("Attempted to make column names unique.")
+  }
+
+  obs_fitted_plot <- ggplot(plot_data_obsfit, aes(x = predictions, y = .data[[response_var]])) +
+    geom_point(alpha = 0.5) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    labs(
+      title = "Observed vs. Fitted Values",
+      subtitle = "Points should cluster around the red dashed line (y=x)",
+      x = "Fitted Values (Predictions)",
+      y = paste("Observed Values (", response_var, ")")
+    ) +
+    theme_minimal() +
+    theme(plot.background = element_rect(fill = "white", color = NA))
+
+  print(obs_fitted_plot)
+  ggsave("observed_vs_fitted_plot.png", plot = obs_fitted_plot, width = 8, height = 8, units = "in", dpi = 300)
+  cat("Saved observed vs. fitted plot to observed_vs_fitted_plot.png\n")
+
+} else {
+  cat("Skipping observed vs. fitted plot because predictions or response variable column are unavailable.\n")
+}
+# --- End of Observed vs Fitted Plot ---
+
+
+# --- Add Residuals vs Fitted Plot ---
+cat("\n--- Generating Residuals vs. Fitted Plot ---\n")
+
+# Check if predictions and residuals are available
+if (!is.null(predictions) && "predictions" %in% colnames(full_data) && "residuals" %in% colnames(full_data)) {
+
+  # Select only the necessary columns for this plot
+  plot_data_resfit <- full_data[, c("predictions", "residuals")]
+  
+  if(any(duplicated(names(plot_data_resfit)))){
+      warning("Duplicate column names detected for Residuals vs. Fitted plot. Plotting might fail.")
+      colnames(plot_data_resfit) <- make.unique(colnames(plot_data_resfit))
+      warning("Attempted to make column names unique.")
+  }
+
+  res_fitted_plot <- ggplot(plot_data_resfit, aes(x = predictions, y = residuals)) +
+    geom_point(alpha = 0.5) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    labs(
+      title = "Residuals vs. Fitted Values",
+      subtitle = "Points should form a random horizontal band around zero",
+      x = "Fitted Values (Predictions)",
+      y = "Residuals (Observed - Fitted)"
+    ) +
+    theme_minimal() +
+    theme(plot.background = element_rect(fill = "white", color = NA))
+
+  print(res_fitted_plot)
+  ggsave("residuals_vs_fitted_plot.png", plot = res_fitted_plot, width = 8, height = 6, units = "in", dpi = 300)
+  cat("Saved residuals vs. fitted plot to residuals_vs_fitted_plot.png\n")
+
+} else {
+  cat("Skipping residuals vs. fitted plot because predictions or residuals are unavailable.\n")
+}
+# --- End of Residuals vs Fitted Plot ---
+
+
+# --- Add Moran's I Test and Plot for Residuals ---
+cat("\n--- Performing Moran's I Test for Residuals ---\n")
+
+# Check if residuals and W matrix are available
+if (!is.null(predictions) && "residuals" %in% colnames(full_data) && !is.null(carbayes_final) && !is.null(carbayes_final$W)) {
+
+  W_matrix <- carbayes_final$W
+  residuals_vec <- full_data$residuals
+
+  # Ensure W is symmetric and convert to listw object
+  if (!isSymmetric(W_matrix)) {
+      warning("W matrix is not symmetric, symmetrizing for Moran's I.")
+      W_matrix <- (W_matrix + t(W_matrix)) / 2
+  }
+  
+  # Check for rows with no neighbours before creating listw
+  no_neighbor_rows <- which(rowSums(W_matrix) == 0)
+  if (length(no_neighbor_rows) > 0) {
+      warning(paste("Found", length(no_neighbor_rows), "locations with no neighbors in W. Moran's I cannot be calculated for these. Excluding them for the test/plot."), call. = FALSE)
+      
+      # Exclude rows with no neighbors from residuals and W for the test
+      residuals_vec_subset <- residuals_vec[-no_neighbor_rows]
+      W_matrix_subset <- W_matrix[-no_neighbor_rows, -no_neighbor_rows]
+      
+      if(nrow(W_matrix_subset) > 0 && length(residuals_vec_subset) > 0) {
+          listw_obj <- tryCatch({
+              mat2listw(W_matrix_subset, style = "W") # style='W' is row-standardized, common for Moran's I
+          }, error = function(e) {
+              cat("Error creating listw object even after subsetting: ", e$message, "\n")
+              return(NULL)
+          })
+      } else {
+          cat("Not enough data remaining after excluding isolates to perform Moran's I.\n")
+          listw_obj <- NULL
+      }
+      
+  } else {
+      # No isolates, proceed with full data
+      residuals_vec_subset <- residuals_vec
+      listw_obj <- tryCatch({
+          mat2listw(W_matrix, style = "W") 
+      }, error = function(e) {
+          cat("Error creating listw object: ", e$message, "\n")
+          return(NULL)
+      })
+  }
+
+  if (!is.null(listw_obj)) {
+    # Perform Moran's I test
+    moran_test_result <- tryCatch({
+      moran.test(residuals_vec_subset, listw = listw_obj, randomisation = TRUE) # Use randomisation test
+    }, error = function(e) {
+      cat("Error during Moran's I test: ", e$message, "\n")
+      return(NULL)
+    })
+
+    if (!is.null(moran_test_result)) {
+      cat("\nMoran's I Test for Model Residuals:\n")
+      print(moran_test_result)
+    }
+
+    # Create Moran scatter plot
+    cat("\nGenerating Moran Scatter Plot for Residuals...\n")
+    png("moran_plot_residuals.png", width = 6, height = 6, units = "in", res = 300)
+    tryCatch({
+      moran.plot(residuals_vec_subset, listw = listw_obj, 
+                 main = "Moran Scatter Plot for Model Residuals",
+                 xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+    }, error = function(e) {
+      cat("Error generating Moran plot: ", e$message, "\n")
+      # Create a blank plot if moran.plot fails, so dev.off() works
+      plot(1, type="n", axes=FALSE, xlab="", ylab="") 
+      title("Moran Plot Failed")
+    }, finally = {
+      dev.off()
+    })
+    cat("Saved Moran scatter plot to moran_plot_residuals.png\n")
+
+  } else {
+    cat("Skipping Moran's I test and plot due to issues creating the spatial weights list object.\n")
+  }
+
+} else {
+  cat("Skipping Moran's I test and plot because residuals or W matrix are unavailable.\n")
+}
+# --- End of Moran's I Test and Plot ---
 
 
 cat("\n--- Script Finished ---\n")
