@@ -90,7 +90,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 3) {
+create_spatial_weights <- function(data, k_neighbors = 10) {
   coords <- as.matrix(data[, c('x', 'y')])
   n <- nrow(coords)
   
@@ -252,10 +252,12 @@ carbayes_model <- R6::R6Class(
 
         # Use the formula stored from the fitted model object
         fit_formula <- self$results$formula
+        predict_on_train <- FALSE # Flag to track prediction type
 
         if (is.null(newdata)) {
-            # Predicting on training data (less common for CV evaluation)
+            # Predicting on training data
             newdata <- self$data_with_re # Use the data exactly as used for fitting
+            predict_on_train <- TRUE
         } else {
             # Predicting on new data (e.g., test set)
             # Ensure factor levels in newdata match training data IF the factor was used in the fit_formula
@@ -360,23 +362,92 @@ carbayes_model <- R6::R6Class(
              eta[valid_rows] <- X[valid_rows, , drop = FALSE] %*% beta_vector
         }
 
+        # --- Spatial random effects (phi) ---
+        eta_spatial <- rep(0, nrow(newdata)) # Initialize spatial effect contribution
+        if (!is.null(self$results$samples$phi)) {
+            phi_mean <- apply(self$results$samples$phi, 2, mean)
+
+            if (predict_on_train) {
+                # If predicting on training data, apply phi directly
+                if(length(phi_mean) == nrow(self$data_with_re)) {
+                    eta_spatial <- phi_mean
+                    message("Applied fitted spatial effects (phi) for training data prediction.")
+                } else {
+                    warning("Could not apply phi to training data due to length mismatch.")
+                }
+            } else {
+                # If predicting on new data, use nearest neighbor approximation
+                if (!is.null(self$data_with_re) && all(self$spatial_vars %in% colnames(self$data_with_re)) &&
+                    all(self$spatial_vars %in% colnames(newdata))) {
+
+                    coords_train <- as.matrix(self$data_with_re[, self$spatial_vars])
+                    coords_test <- as.matrix(newdata[, self$spatial_vars])
+
+                    # Check for NAs in coordinates
+                    valid_train_coords <- !apply(coords_train, 1, anyNA)
+                    valid_test_coords <- !apply(coords_test, 1, anyNA)
+
+                    if (sum(valid_train_coords) > 0 && sum(valid_test_coords) > 0) {
+                        # Find nearest valid training point for each valid test point
+                        nn_result <- FNN::get.knnx(
+                            coords_train[valid_train_coords, , drop = FALSE],
+                            coords_test[valid_test_coords, , drop = FALSE],
+                            k = 1
+                        )
+                        nearest_train_indices_relative <- nn_result$nn.index[, 1]
+                        # Map relative indices back to original training data indices
+                        original_train_indices <- which(valid_train_coords)[nearest_train_indices_relative]
+
+                        # Ensure phi_mean corresponds to the original training data order
+                        if(length(phi_mean) == nrow(self$data_with_re)) {
+                            # Map the nearest training index to its spatial effect
+                            eta_spatial[valid_test_coords] <- phi_mean[original_train_indices]
+                            eta_spatial[!valid_test_coords] <- 0 # Assign 0 if coords were NA
+                            cat("Applied nearest neighbor spatial effect (phi) approximation for CARBayes prediction on new data.\n")
+                        } else {
+                            warning("Could not apply NN spatial effect (phi): Mismatch between phi length and training data size.")
+                        }
+                    } else {
+                        warning("Could not apply NN spatial effect (phi): No valid coordinates found in training or test data.")
+                    }
+                } else {
+                    warning("Could not apply NN spatial effect (phi): Coordinate columns missing or training data unavailable.")
+                }
+            }
+        } else {
+            warning("Spatial random effect samples (phi) not found in CARBayes results.")
+        }
+        # --- End Spatial random effects ---
+
+        # Add spatial effect to linear predictor (eta)
+        # Ensure dimensions match before adding, handle NAs in eta
+        valid_eta <- !is.na(eta)
+        if(length(eta_spatial) == length(eta)) {
+            eta[valid_eta] <- eta[valid_eta] + eta_spatial[valid_eta]
+        } else if (length(eta_spatial) > 0 && length(valid_eta) > 0) {
+            # Fallback if lengths differ but some valid eta exist (should not happen ideally)
+             warning("Length mismatch between eta and spatial effects, attempting partial addition.")
+             min_len <- min(length(eta_spatial), sum(valid_eta))
+             eta[which(valid_eta)[1:min_len]] <- eta[which(valid_eta)[1:min_len]] + eta_spatial[1:min_len]
+        } else {
+             warning("Could not add spatial effects due to length mismatch or NA eta.")
+        }
+
+
         lambda <- exp(eta) # NAs in eta will result in NAs in lambda
 
-        # Spatial random effects (phi) - DO NOT apply for block CV prediction on test data
-        if (!is.null(self$results$samples$phi) && !is.null(newdata) && !identical(newdata, self$data_with_re)) {
-             # message("Spatial random effects (phi) from training data are not applied during prediction on new/test data in block CV.")
-        } else if (!is.null(self$results$samples$phi) && is.null(newdata)) {
-             # If predicting on training data, apply phi
-             phi_mean <- apply(self$results$samples$phi, 2, mean)
-             if(length(phi_mean) == nrow(self$data_with_re)) {
-                 # Ensure lambda and phi_mean align if NAs were produced
-                 lambda_valid <- !is.na(lambda)
-                 if(length(lambda_valid) == length(phi_mean)) {
-                    lambda[lambda_valid] <- lambda[lambda_valid] * exp(phi_mean[lambda_valid])
-                 } else {
-                    warning("Could not apply phi due to length mismatch potentially caused by NAs.")
-                 }
-             }
+        # Impute remaining NAs in lambda (e.g., from NA in X or failed spatial effect)
+        na_lambda <- is.na(lambda)
+        if(any(na_lambda)) {
+            # Use mean of training response for imputation
+            if(!is.null(self$data_with_re) && response_var %in% colnames(self$data_with_re)) {
+                 mean_response <- mean(self$data_with_re[[response_var]], na.rm = TRUE)
+                 lambda[na_lambda] <- mean_response
+                 cat("Imputed", sum(na_lambda), "NA predictions in CARBayes with training mean response.\n")
+            } else {
+                 lambda[na_lambda] <- 1 # Fallback if training response unavailable
+                 cat("Imputed", sum(na_lambda), "NA predictions in CARBayes with 1 (training mean unavailable).\n")
+            }
         }
 
         return(lambda)
@@ -747,7 +818,8 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     inla_model <- try(inla(inla_formula,
                            data = train_data_inla, # Use training data
                            family = "nbinomial",
-                           # control.predictor = list(compute = TRUE), # Not needed as we predict manually
+                           # Add compute=TRUE for predictor to get spatial effects easily
+                           control.predictor = list(compute = TRUE, link = 1),
                            control.compute = list(dic = TRUE, waic = TRUE, config = TRUE, return.marginals.predictor=FALSE), # Save memory
                            control.family = nb_family_control,
                            control.mode = inla_control_mode,
@@ -809,27 +881,69 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
         }
 
         # Calculate fixed effects contribution to linear predictor
-        if(ncol(X_test) > 0) {
+        if(ncol(X_test) > 0 && length(beta_mean) == ncol(X_test)) { # Check alignment before multiplication
             eta_fixed <- X_test %*% beta_mean
-        } else {
-            eta_fixed <- rep(0, nrow(test_data)) # Or handle intercept separately if needed
+        } else if ("(Intercept)" %in% names(beta_mean) && ncol(X_test) == 1 && colnames(X_test) == "(Intercept)") {
+             # Handle intercept-only case explicitly
+             eta_fixed <- X_test %*% beta_mean["(Intercept)"]
+        } else if (length(selected_features) == 0 && "(Intercept)" %in% names(beta_mean)) {
+             # Handle case where LASSO selected 0 features, formula was ~ 1
+             eta_fixed <- rep(beta_mean["(Intercept)"], nrow(test_data))
         }
+         else {
+            cat("Warning: Could not align fixed effects for INLA prediction in fold", i, ". Setting fixed effect contribution to 0.\n")
+            eta_fixed <- rep(0, nrow(test_data))
+        }
+
 
         # Get mean random effects for borough
         re_summary <- inla_model$summary.random[[random_effect]]
-        # Create a mapping from borough level to its mean effect
         re_map <- setNames(re_summary$mean, re_summary$ID)
-        # Get the corresponding random effect for each test observation
-        # Use 0 for any borough levels in test set not seen in training (factor handling should prevent this)
         eta_random <- re_map[as.character(test_data[[random_effect]])]
-        eta_random[is.na(eta_random)] <- 0 # Handle potential NAs just in case
+        eta_random[is.na(eta_random)] <- 0 # Use 0 for levels not in training summary
 
-        # Combine fixed and random effects (OMIT spatial effect for test block)
-        eta_test <- eta_fixed + eta_random
+        # --- Approximate Spatial Effect using Nearest Neighbor ---
+        eta_spatial_approx <- rep(0, nrow(test_data)) # Initialize with 0
+        if (!is.null(inla_model$summary.random$idx_train_spatial)) {
+            # Get coordinates of training and test data
+            coords_train <- train_data_inla[, c("x", "y")]
+            coords_test <- test_data[, c("x", "y")]
+
+            # Find the index of the nearest training point for each test point
+            nn_result <- FNN::get.knnx(coords_train, coords_test, k = 1)
+            nearest_train_indices <- nn_result$nn.index[, 1]
+
+            # Get the fitted spatial effects (combined BYM2 effect) for training points
+            # The summary is ordered by the internal index (1:nrow(train_data_inla))
+            spatial_effects_train <- inla_model$summary.random$idx_train_spatial$mean
+
+            # Ensure lengths match before indexing
+            if(length(spatial_effects_train) == nrow(train_data_inla)) {
+                 # Map the nearest training index to its spatial effect
+                 eta_spatial_approx <- spatial_effects_train[nearest_train_indices]
+                 eta_spatial_approx[is.na(eta_spatial_approx)] <- 0 # Handle potential NAs
+                 cat("Applied nearest neighbor spatial effect approximation for INLA prediction.\n")
+            } else {
+                 warning("Could not apply nearest neighbor spatial effect: Mismatch between spatial effects length and training data size.")
+            }
+        } else {
+             warning("Spatial random effect 'idx_train_spatial' not found in INLA model summary.")
+        }
+        # --- End Spatial Effect Approximation ---
+
+
+        # Combine fixed, random (borough), and approximated spatial effects
+        eta_test <- eta_fixed + eta_random + eta_spatial_approx # Add spatial approx
 
         # Apply inverse link function (exponential for Poisson/NB log link)
         inla_test_preds <- exp(eta_test)
-        inla_test_preds[is.na(inla_test_preds)] <- mean(train_data_inla[[response_var]]) # Impute NAs if any step failed
+        # Impute NAs with mean of training response if any step failed leading to NA eta
+        na_preds <- is.na(inla_test_preds)
+        if(any(na_preds)) {
+            inla_test_preds[na_preds] <- mean(train_data_inla[[response_var]], na.rm = TRUE)
+            cat("Imputed", sum(na_preds), "NA predictions in INLA with training mean.\n")
+        }
+
 
         # Calculate metrics for INLA
         inla_test_mae <- mean(abs(test_data[[response_var]] - inla_test_preds), na.rm = TRUE)
@@ -1076,9 +1190,8 @@ cat("Running combined borough-fold cross-validation...\n") # Updated message
 cv_results <- run_combined_cross_validation(
   data = full_data,
   response_var = "acc",
-  # k is no longer passed here, it's defined inside the function
-  random_effect = "borough", # Still needed for model specification and fold definition
-  max_features = 30
+  random_effect = "borough",
+  max_features = 10
 )
 
 # Retrieve the data with fold assignments for figure generation
