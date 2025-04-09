@@ -969,111 +969,227 @@ if (!all(required_cols %in% colnames(full_data))) {
     stop("Missing required columns in full_data: ", paste(setdiff(required_cols, colnames(full_data)), collapse=", "))
 }
 
+# Add this function before the run_and_compare_models function
+save_plot_safe <- function(plot, filename, width = 8, height = 6, ...) {
+  if (is.null(plot)) {
+    warning(paste("Cannot save plot to", filename, "- plot object is NULL"))
+    return(FALSE)
+  }
+  
+  # Create results directory if it doesn't exist
+  if (!dir.exists("results")) {
+    dir.create("results")
+  }
+  
+  # Full path for saving
+  filepath <- file.path("results", filename)
+  
+  # Try to save the plot
+  result <- tryCatch({
+    ggsave(filepath, plot, width = width, height = height, ...)
+    TRUE
+  }, error = function(e) {
+    warning(paste("Failed to save plot to", filepath, ":", e$message))
+    FALSE
+  })
+  
+  if (result) {
+    cat(paste("Saved plot to", filepath, "\n"))
+  }
+  
+  return(result)
+}
 
-cat("Training and evaluating CARBayes model on the full dataset...\n") # Updated message
-# Use k=3 neighbors for weights, max_features=40 for LASSO
-carbayes_output <- train_and_evaluate_carbayes(
+# Define a function to run both models and compare them
+run_and_compare_models <- function(data, response_var = "acc", random_effect = "borough", max_features = 40) {
+  cat("\n==== Running Models With and Without Random Effect ====\n")
+  
+  # First run model WITH random effect
+  cat("\n--- Training CARBayes Model WITH Random Effect ---\n")
+  carbayes_with_re <- train_and_evaluate_carbayes(
+    data = data,
+    response_var = response_var,
+    random_effect = random_effect,
+    max_features = max_features
+  )
+  
+  # Then run model WITHOUT random effect
+  cat("\n--- Training CARBayes Model WITHOUT Random Effect ---\n")
+  carbayes_without_re <- train_and_evaluate_carbayes(
+    data = data,
+    response_var = response_var,
+    random_effect = NULL, # Set to NULL to exclude random effect
+    max_features = max_features
+  )
+  
+  # Generate figures ONLY for model WITH random effect
+  cat("\n--- Generating Figures for Model WITH Random Effect ---\n")
+  figures_with_re <- generate_carbayes_figures(carbayes_with_re, data)
+  
+  # Save figures ONLY for model WITH random effect
+  cat("\n--- Saving Figures for Model WITH Random Effect ---\n")
+
+  # Create results directory if it doesn't exist
+  if (!dir.exists("results")) {
+    dir.create("results")
+  }
+
+  # Save plots for model WITH random effect
+  save_plot_safe(figures_with_re$scatter_obs_fitted, "observed_vs_fitted_with_re.png", width = 8, height = 6)
+  save_plot_safe(figures_with_re$map_weights, "spatial_weights_map_with_re.png", width = 10, height = 10)
+  save_plot_safe(figures_with_re$plot_coefficients, "coefficients_plot_with_re.png", 
+            width = 8, height = max(4, length(figures_with_re$plot_coefficients$data$Parameter) * 0.3), 
+            limitsize = FALSE)
+  save_plot_safe(figures_with_re$map_residuals, "residuals_map_with_re.png", width = 10, height = 8)
+  save_plot_safe(figures_with_re$map_phi, "phi_map_with_re.png", width = 10, height = 8)
+  save_plot_safe(figures_with_re$plot_res_fitted, "residuals_vs_fitted_with_re.png", width = 8, height = 6)
+  
+  # Compare model performance
+  cat("\n==== Model Comparison ====\n")
+  
+  # Performance metrics
+  cat("\n--- Performance Metrics ---\n")
+  metrics_df <- data.frame(
+    Model = c("With Random Effect", "Without Random Effect"),
+    MAE = c(carbayes_with_re$performance$mae, carbayes_without_re$performance$mae),
+    RMSE = c(carbayes_with_re$performance$rmse, carbayes_without_re$performance$rmse)
+  )
+  print(metrics_df)
+  
+  # Moran's I test results
+  cat("\n--- Moran's I Test Results ---\n")
+  cat("Model WITH Random Effect:\n")
+  if (!is.null(figures_with_re$moran_test_result)) {
+    print(figures_with_re$moran_test_result)
+  } else {
+    cat("Moran's I test result not available\n")
+  }
+  
+  # Manual LRT calculation
+  cat("\n--- Manual Likelihood Ratio Test ---\n")
+  if (!is.null(carbayes_with_re$model_object$results) && !is.null(carbayes_without_re$model_object$results)) {
+    # Extract deviance values (which are -2*log-likelihood)
+    if ("deviance" %in% names(carbayes_with_re$model_object$results$modelfit) && 
+        "deviance" %in% names(carbayes_without_re$model_object$results$modelfit)) {
+      
+      # Get deviance values
+      dev_with_re <- carbayes_with_re$model_object$results$modelfit["deviance"]
+      dev_without_re <- carbayes_without_re$model_object$results$modelfit["deviance"]
+      
+      # Calculate log-likelihoods from deviance (-deviance/2)
+      ll_with_re <- -dev_with_re/2
+      ll_without_re <- -dev_without_re/2
+      
+      # Calculate LRT statistic
+      lrt_stat <- 2 * (ll_with_re - ll_without_re)
+      
+      # Degrees of freedom - number of random effect levels minus 1
+      if (!is.null(carbayes_with_re$model_object$data_with_re[[random_effect]])) {
+        df <- length(levels(carbayes_with_re$model_object$data_with_re[[random_effect]])) - 1
+      } else {
+        df <- 1 # Default if we can't determine the number of levels
+      }
+      
+      # Calculate p-value
+      p_value <- pchisq(lrt_stat, df = df, lower.tail = FALSE)
+      
+      cat("Deviance (with RE):", dev_with_re, "\n")
+      cat("Deviance (without RE):", dev_without_re, "\n")
+      cat("Log-likelihood (with RE):", ll_with_re, "\n")
+      cat("Log-likelihood (without RE):", ll_without_re, "\n")
+      cat("LRT statistic:", lrt_stat, "\n")
+      cat("Degrees of freedom:", df, "\n")
+      cat("p-value:", p_value, "\n")
+      
+      if (p_value < 0.05) {
+        cat("Conclusion: The random effect on borough is statistically significant (p < 0.05).\n")
+      } else {
+        cat("Conclusion: The random effect on borough is not statistically significant (p >= 0.05).\n")
+      }
+    } else {
+      cat("Deviance values not found in model results. Cannot perform manual LRT.\n")
+      
+      # Try to find other ways to get log-likelihood
+      if ("loglikelihood" %in% rownames(as.data.frame(carbayes_with_re$model_object$results$summary.results)) &&
+          "loglikelihood" %in% rownames(as.data.frame(carbayes_without_re$model_object$results$summary.results))) {
+        
+        ll_with_re <- as.data.frame(carbayes_with_re$model_object$results$summary.results)["loglikelihood", "Mean"]
+        ll_without_re <- as.data.frame(carbayes_without_re$model_object$results$summary.results)["loglikelihood", "Mean"]
+        
+        # Calculate LRT statistic
+        lrt_stat <- 2 * (ll_with_re - ll_without_re)
+        
+        # Degrees of freedom
+        if (!is.null(carbayes_with_re$model_object$data_with_re[[random_effect]])) {
+          df <- length(levels(carbayes_with_re$model_object$data_with_re[[random_effect]])) - 1
+        } else {
+          df <- 1
+        }
+        
+        # Calculate p-value
+        p_value <- pchisq(lrt_stat, df = df, lower.tail = FALSE)
+        
+        cat("Log-likelihood from summary (with RE):", ll_with_re, "\n")
+        cat("Log-likelihood from summary (without RE):", ll_without_re, "\n")
+        cat("LRT statistic:", lrt_stat, "\n")
+        cat("Degrees of freedom:", df, "\n")
+        cat("p-value:", p_value, "\n")
+        
+        if (p_value < 0.05) {
+          cat("Conclusion: The random effect on borough is statistically significant (p < 0.05).\n")
+        } else {
+          cat("Conclusion: The random effect on borough is not statistically significant (p >= 0.05).\n")
+        }
+      } else {
+        cat("Could not find log-likelihood values in any standard location. Manual LRT cannot be performed.\n")
+      }
+    }
+  } else {
+    cat("Cannot perform manual LRT: Model results not available\n")
+  }
+  
+  # DIC comparison
+  cat("\n--- DIC Comparison ---\n")
+  if (!is.null(carbayes_with_re$model_object$results$modelfit) && 
+      !is.null(carbayes_without_re$model_object$results$modelfit)) {
+    dic_with_re <- carbayes_with_re$model_object$results$modelfit["DIC"]
+    dic_without_re <- carbayes_without_re$model_object$results$modelfit["DIC"]
+    
+    cat("DIC (with RE):", dic_with_re, "\n")
+    cat("DIC (without RE):", dic_without_re, "\n")
+    cat("DIC difference (without - with):", dic_without_re - dic_with_re, "\n")
+    
+    if (dic_with_re < dic_without_re) {
+      cat("Conclusion: The model WITH random effect has lower DIC and is preferred.\n")
+    } else if (dic_without_re < dic_with_re) {
+      cat("Conclusion: The model WITHOUT random effect has lower DIC and is preferred.\n")
+    } else {
+      cat("Conclusion: Both models have similar DIC values.\n")
+    }
+  } else {
+    cat("Cannot compare DIC: Values not available\n")
+  }
+  
+  # Add this before the LRT section
+  cat("Model with RE structure:\n")
+  str(carbayes_with_re$model_object$results$modelfit, max.level=1)
+  cat("Model without RE structure:\n")
+  str(carbayes_without_re$model_object$results$modelfit, max.level=1)
+  
+  # Return both model outputs but only figures for WITH random effect
+  return(list(
+    with_re = carbayes_with_re,
+    without_re = carbayes_without_re,
+    figures_with_re = figures_with_re
+  ))
+}
+
+# Run both models and compare them
+model_comparison <- run_and_compare_models(
   data = full_data,
   response_var = "acc",
   random_effect = "borough",
   max_features = 40
 )
-
-# Print Results (Ensure results exist before accessing)
-cat("\n==== CARBayes Model Results (Training on Full Dataset) ====\n")
-if (!is.null(carbayes_output) && !is.null(carbayes_output$performance)) {
-    perf <- carbayes_output$performance
-    # Use %||% NA helper function
-    `%||%` <- function(a, b) if (!is.null(a) && !is.na(a)) a else b
-
-    cat(sprintf("Training MAE: %.4f\n", perf$mae %||% NA))
-    cat(sprintf("Training MSE: %.4f\n", perf$mse %||% NA))
-    cat(sprintf("Training RMSE: %.4f\n", perf$rmse %||% NA))
-
-    # Optionally print model summary details if needed
-    # print(carbayes_output$results_summary)
-
-} else {
-    cat("CARBayes results are not available.\n")
-}
-
-# Removed SEM and INLA result printing
-# Removed Model Comparison section
-
-# After running the model, generate and display the figures
-cat("\nGenerating diagnostic and prediction comparison figures from CARBayes results...\n") # Updated message
-# Pass the CARBayes output and the original full_data
-figures_list <- generate_carbayes_figures(carbayes_output, full_data) # Use updated variable name
-
-# --- Save the generated figures ---
-# Helper function to save plots safely
-save_plot_safe <- function(plot_obj, filename, ...) {
-    # Create results directory if it doesn't exist
-    if (!dir.exists("results")) {
-        dir.create("results")
-        cat("Created 'results' directory\n")
-    }
-    
-    # Prepend the results/ path to the filename
-    filepath <- file.path("results", filename)
-    
-    if (!is.null(plot_obj) && inherits(plot_obj, "ggplot")) {
-        ggsave(filepath, plot_obj, ...)
-        cat(paste("Plot saved as", filepath, "\n"))
-    } else {
-        cat(paste("Plot for", filename, "could not be generated or is not a ggplot object.\n"))
-    }
-}
-
-cat("\n--- Saving Plots ---\n")
-# Removed the line that saves the predicted accidents map
-# save_plot_safe(figures_list$map_predicted, "predicted_accidents_map_full_data.png", width = 10, height = 8)
-save_plot_safe(figures_list$scatter_obs_fitted, "observed_vs_fitted_full_data.png", width = 8, height = 6) # Renamed file
-
-# New plots
-save_plot_safe(figures_list$map_weights, "spatial_weights_map_full_data.png", width = 10, height = 10)
-save_plot_safe(figures_list$plot_coefficients, "coefficients_plot_full_data.png", width = 8, height = max(4, length(figures_list$plot_coefficients$data$Parameter) * 0.3), limitsize = FALSE) # Dynamic height
-save_plot_safe(figures_list$map_residuals, "residuals_map_full_data.png", width = 10, height = 8)
-save_plot_safe(figures_list$map_phi, "phi_map_full_data.png", width = 10, height = 8)
-save_plot_safe(figures_list$plot_res_fitted, "residuals_vs_fitted_full_data.png", width = 8, height = 6)
-
-# Moran plot is saved within the function, so we need to modify that part too
-# Update the generate_carbayes_figures function to save Moran plot to results folder
-
-# Display summary statistics of predictions if available
-# Use the data returned from the plotting function
-if (!is.null(figures_list$predictions_data) && nrow(figures_list$predictions_data) > 0) {
-    pred_data <- figures_list$predictions_data
-    cat("\nSummary of predictions (CARBayes - Training Data):\n")
-    print(summary(pred_data$predicted[!is.na(pred_data$predicted)])) # Exclude NAs
-    cat("\nSummary of actual values (Training Data):\n")
-    print(summary(pred_data$actual[!is.na(pred_data$actual)])) # Exclude NAs
-    cat("\nSummary of residuals (Training Data):\n")
-    print(summary(pred_data$residuals[!is.na(pred_data$residuals)])) # Exclude NAs
-
-    # Calculate additional metrics if possible
-    valid_data <- pred_data[!is.na(pred_data$actual) & !is.na(pred_data$predicted), ]
-    if(nrow(valid_data) > 1) {
-        cat("\nAdditional metrics (CARBayes - Training Data):\n")
-        correlation <- cor(valid_data$actual, valid_data$predicted)
-        cat(sprintf("Correlation (Observed vs Fitted): %.4f\n", correlation))
-        cat(sprintf("R-squared: %.4f\n", correlation^2))
-        # You can add MAE/RMSE here as well if desired, although they are printed earlier
-        mae <- mean(abs(valid_data$residuals))
-        rmse <- sqrt(mean(valid_data$residuals^2))
-        cat(sprintf("MAE: %.4f\n", mae))
-        cat(sprintf("RMSE: %.4f\n", rmse))
-    } else {
-        cat("Not enough valid data points to calculate correlation/R-squared.\n")
-    }
-    # Print Moran's I test results if available
-    if(!is.null(figures_list$moran_test_result)) {
-        cat("\nMoran's I Test Result for Residuals:\n")
-        print(figures_list$moran_test_result)
-    }
-
-} else {
-    cat("\nNo valid prediction data available to summarize.\n")
-}
 
 cat("\nScript finished.\n")
