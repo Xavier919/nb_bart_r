@@ -376,7 +376,7 @@ carbayes_model <- R6::R6Class(
                     warning("Could not apply phi to training data due to length mismatch.")
                 }
             } else {
-                # If predicting on new data, use nearest neighbor approximation
+                # If predicting on new data, use k-nearest neighbors with inverse distance weighting
                 if (!is.null(self$data_with_re) && all(self$spatial_vars %in% colnames(self$data_with_re)) &&
                     all(self$spatial_vars %in% colnames(newdata))) {
 
@@ -388,37 +388,61 @@ carbayes_model <- R6::R6Class(
                     valid_test_coords <- !apply(coords_test, 1, anyNA)
 
                     if (sum(valid_train_coords) > 0 && sum(valid_test_coords) > 0) {
-                        # Find nearest valid training point for each valid test point
+                        # Find k nearest *valid* training points for each *valid* test point
+                        k_interp <- 5 # Number of neighbors for interpolation
                         nn_result <- FNN::get.knnx(
                             coords_train[valid_train_coords, , drop = FALSE],
                             coords_test[valid_test_coords, , drop = FALSE],
-                            k = 1
+                            k = k_interp
                         )
-                        nearest_train_indices_relative <- nn_result$nn.index[, 1]
+
                         # Map relative indices back to original training data indices
-                        original_train_indices <- which(valid_train_coords)[nearest_train_indices_relative]
+                        original_train_indices_matrix <- matrix(which(valid_train_coords)[nn_result$nn.index],
+                                                                nrow = nrow(nn_result$nn.index),
+                                                                ncol = k_interp)
 
                         # Ensure phi_mean corresponds to the original training data order
                         if(length(phi_mean) == nrow(self$data_with_re)) {
-                            # Map the nearest training index to its spatial effect
-                            eta_spatial <- phi_mean[original_train_indices]
-                            eta_spatial[is.na(eta_spatial)] <- 0 # Handle potential NAs
-                            cat("Applied nearest neighbor spatial effect approximation for CARBayes prediction.\n")
+                            # Initialize eta_spatial for all test points (including those with NA coords)
+                            eta_spatial <- rep(0, nrow(newdata))
+                            # Get indices of test points with valid coordinates
+                            valid_test_indices <- which(valid_test_coords)
+
+                            # Loop through valid test points to calculate IDW
+                            for (j in 1:length(valid_test_indices)) {
+                                test_idx <- valid_test_indices[j] # Original index in newdata
+                                neighbor_orig_indices <- original_train_indices_matrix[j, ]
+                                distances <- nn_result$nn.dist[j, ]
+
+                                # Handle zero distances - assign infinite weight (effectively becomes nearest neighbor)
+                                zero_dist_idx <- which(distances < 1e-9) # Use a small tolerance
+                                if (length(zero_dist_idx) > 0) {
+                                    # If one or more points have zero distance, use the effect of the first one found
+                                    eta_spatial[test_idx] <- phi_mean[neighbor_orig_indices[zero_dist_idx[1]]]
+                                } else {
+                                    # Apply inverse distance weighting
+                                    weights <- 1 / distances
+                                    weights <- weights / sum(weights) # Normalize weights
+
+                                    # Weighted average of spatial effects
+                                    eta_spatial[test_idx] <- sum(phi_mean[neighbor_orig_indices] * weights, na.rm = TRUE) # Add na.rm for safety
+                                }
+                            }
+                            cat("Applied inverse distance weighted spatial effect interpolation (k=", k_interp, ") for CARBayes prediction.\n")
                         } else {
-                            warning("Could not apply nearest neighbor spatial effect: Mismatch between spatial effects length and training data size.")
+                            warning("Could not apply IDW spatial effect: Mismatch between spatial effects length and training data size.")
                         }
                     } else {
-                        warning("Could not apply NN spatial effect: No valid coordinates found in training or test data.")
+                        warning("Could not apply IDW spatial effect: No valid coordinates found in training or test data.")
                     }
                 } else {
-                    warning("Could not apply NN spatial effect: Coordinate columns missing or training data unavailable.")
+                    warning("Could not apply IDW spatial effect: Coordinate columns missing or training data unavailable.")
                 }
             }
         } else {
             warning("Spatial random effect samples (phi) not found in CARBayes results.")
         }
         # --- End Spatial random effects ---
-
 
         # Add spatial effect to linear predictor (eta)
         # Ensure dimensions match before adding, handle NAs in eta
