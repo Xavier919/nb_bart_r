@@ -229,8 +229,8 @@ carbayes_model <- R6::R6Class(
         data = data_to_use, # data_to_use has factor conversion if needed
         W = self$W,
         burnin = 2000,
-        n.sample = 10000,
-        thin = 4,
+        n.sample = 5000,
+        thin = 2,
         #rho = 0.8,
         verbose = TRUE
       )
