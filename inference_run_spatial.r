@@ -858,7 +858,7 @@ generate_carbayes_figures <- function(carbayes_output, full_data) {
 
   # --- Figure 8: Moran's I Test and Plot for Residuals ---
   # Note: Moran plot is saved directly, not returned as ggplot object
-  moran_plot_path <- "moran_plot_residuals_full_data.png"
+  moran_plot_path <- file.path("results", "moran_plot_residuals_full_data.png")
   plots_list$moran_plot_path <- NULL # Initialize path as NULL
 
   if (!is.null(W_matrix) && nrow(plot_data_res) > 0) { # Use plot_data_res which has NA residuals removed
@@ -907,6 +907,11 @@ generate_carbayes_figures <- function(carbayes_output, full_data) {
                   plots_list$moran_test_result <- moran_test_result # Store test result
               }
 
+              # Create results directory if it doesn't exist (for Moran plot)
+              if (!dir.exists("results")) {
+                  dir.create("results")
+              }
+              
               # Create Moran scatter plot
               cat("\nGenerating Moran Scatter Plot for Residuals...\n")
               png(moran_plot_path, width = 6, height = 6, units = "in", res = 300)
@@ -988,9 +993,18 @@ figures_list <- generate_carbayes_figures(carbayes_output, full_data) # Use upda
 # --- Save the generated figures ---
 # Helper function to save plots safely
 save_plot_safe <- function(plot_obj, filename, ...) {
+    # Create results directory if it doesn't exist
+    if (!dir.exists("results")) {
+        dir.create("results")
+        cat("Created 'results' directory\n")
+    }
+    
+    # Prepend the results/ path to the filename
+    filepath <- file.path("results", filename)
+    
     if (!is.null(plot_obj) && inherits(plot_obj, "ggplot")) {
-        ggsave(filename, plot_obj, ...)
-        cat(paste("Plot saved as", filename, "\n"))
+        ggsave(filepath, plot_obj, ...)
+        cat(paste("Plot saved as", filepath, "\n"))
     } else {
         cat(paste("Plot for", filename, "could not be generated or is not a ggplot object.\n"))
     }
@@ -1008,13 +1022,8 @@ save_plot_safe(figures_list$map_residuals, "residuals_map_full_data.png", width 
 save_plot_safe(figures_list$map_phi, "phi_map_full_data.png", width = 10, height = 8)
 save_plot_safe(figures_list$plot_res_fitted, "residuals_vs_fitted_full_data.png", width = 8, height = 6)
 
-# Moran plot is saved within the function, path stored in figures_list$moran_plot_path
-if (!is.null(figures_list$moran_plot_path)) {
-    cat(paste("Moran plot was saved to:", figures_list$moran_plot_path, "\n"))
-} else {
-    cat("Moran plot could not be generated or saved.\n")
-}
-
+# Moran plot is saved within the function, so we need to modify that part too
+# Update the generate_carbayes_figures function to save Moran plot to results folder
 
 # Display summary statistics of predictions if available
 # Use the data returned from the plotting function

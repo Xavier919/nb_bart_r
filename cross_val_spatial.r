@@ -601,6 +601,9 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
   # --- Generate Map of Folds/Parts (Optional Visualization) ---
   cat("\nGenerating map of cross-validation part assignments...\n")
 
+  # Create results directory if it doesn't exist
+  dir.create("results", showWarnings = FALSE)
+
   # --- FIX: Ensure unique column names before plotting ---
   if(any(duplicated(colnames(data)))) {
       cat("WARNING: Duplicate column names found in 'data' before plotting. Keeping first instance...\n")
@@ -645,8 +648,8 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     print(part_map_plot) # Print the plot
 
     # Save the plot
-    ggsave("cv_stratified_part_map_assignment.png", part_map_plot, width = 8, height = 8) # Update filename
-    cat("Part assignment map saved as 'cv_stratified_part_map_assignment.png'\n")
+    ggsave("results/cv_stratified_part_map_assignment.png", part_map_plot, width = 8, height = 8) # Updated path
+    cat("Part assignment map saved as 'results/cv_stratified_part_map_assignment.png'\n")
 
   } else {
     cat("Could not generate part map: Required columns ('x', 'y', 'part_id') not found in the data after handling duplicates.\n")
