@@ -59,11 +59,9 @@ load_and_prepare_data <- function() {
   
   spatial_cols <- c('x', 'y')
   feature_cols <- c('ln_fi', 'ln_fri', 'ln_fli', 'ln_pi', 'ln_cti', 'ln_cli', 'ln_cri', 'ln_distdt',
-                   'fi', 'fri', 'fli', 'pi', 'cti', 'cli', 'cri', 'distdt',
-                   'total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw',
-                   'commercial', 'number_of_', 'of_exclusi', 'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r',
-                   'any_ped_pr', 'ped_countd', 'lt_restric', 'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra',
-                   'parking', 'north_veh', 'north_ped', 'east_veh', 'east_ped', 'south_veh', 'south_ped', 'west_veh', 'west_ped')
+                   'total_lane', 'avg_crossw', 'tot_road_w', 'tot_crossw', 'commercial', 'number_of_', 'of_exclusi', 
+                   'curb_exten', 'median', 'all_pedest', 'half_phase', 'new_half_r', 'any_ped_pr', 'ped_countd', 'lt_restric',
+                   'lt_prot_re', 'lt_protect', 'any_exclus', 'all_red_an', 'green_stra', 'parking')
   
   feature_cols <- feature_cols[feature_cols %in% colnames(data)]
   spatial_cols <- spatial_cols[spatial_cols %in% colnames(data)]
@@ -90,7 +88,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 3) {
+create_spatial_weights <- function(data, k_neighbors = 5) {
   coords <- as.matrix(data[, c('x', 'y')])
   n <- nrow(coords)
   
@@ -1293,7 +1291,7 @@ cv_results <- run_combined_cross_validation(
   data = full_data,
   response_var = "acc",
   random_effect = "borough", # Used for district stratification
-  max_features = 10
+  max_features = 40
 )
 
 # Retrieve the data with fold assignments for figure generation
