@@ -220,8 +220,23 @@ carbayes_model <- R6::R6Class(
           }
       }
 
+      # MODIFICATION: Add random effect to formula if not already included
+      if (!is.null(self$random_effect) && self$random_effect %in% colnames(data_to_use)) {
+        # Check if random effect is already in the formula
+        formula_terms <- attr(terms(full_formula), "term.labels")
+        if (!self$random_effect %in% formula_terms) {
+          # Add random effect to formula
+          formula_str <- as.character(full_formula)
+          rhs <- formula_str[3]  # Right-hand side of formula
+          new_rhs <- paste(rhs, "+", self$random_effect)
+          new_formula_str <- paste(formula_str[2], formula_str[1], new_rhs)
+          full_formula <- as.formula(new_formula_str)
+          cat("Added random effect '", self$random_effect, "' to CARBayes formula\n", sep="")
+        }
+      }
+
       model <- S.CARleroux(
-        formula = full_formula, # Use the formula passed in
+        formula = full_formula, # Use the modified formula with random effect
         family = "poisson",
         data = data_to_use, # data_to_use has factor conversion if needed
         W = self$W,
