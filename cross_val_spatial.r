@@ -88,7 +88,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 5) {
+create_spatial_weights <- function(data, k_neighbors = 10) {
   coords <- as.matrix(data[, c('x', 'y')])
   n <- nrow(coords)
   
@@ -229,8 +229,8 @@ carbayes_model <- R6::R6Class(
         data = data_to_use, # data_to_use has factor conversion if needed
         W = self$W,
         burnin = 2000,
-        n.sample = 5000,
-        thin = 2,
+        n.sample = 10000,
+        thin = 4,
         #rho = 0.8,
         verbose = TRUE
       )
@@ -387,7 +387,7 @@ carbayes_model <- R6::R6Class(
 
                     if (sum(valid_train_coords) > 0 && sum(valid_test_coords) > 0) {
                         # Find k nearest *valid* training points for each *valid* test point
-                        k_interp <- 5 # Number of neighbors for interpolation
+                        k_interp <- 10 # Number of neighbors for interpolation
                         nn_result <- FNN::get.knnx(
                             coords_train[valid_train_coords, , drop = FALSE],
                             coords_test[valid_test_coords, , drop = FALSE],
