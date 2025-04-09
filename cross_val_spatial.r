@@ -80,7 +80,7 @@ load_and_prepare_data <- function() {
     }
   }
   
-  id_cols <- c('int_no', 'acc', 'pi', 'borough')
+  id_cols <- c('int_no', 'acc', 'borough')
   id_cols <- id_cols[id_cols %in% colnames(data)]
   
   full_data <- cbind(data[, id_cols], X_base, X_spatial)
@@ -90,7 +90,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 10) {
+create_spatial_weights <- function(data, k_neighbors = 3) {
   coords <- as.matrix(data[, c('x', 'y')])
   n <- nrow(coords)
   
@@ -401,23 +401,24 @@ carbayes_model <- R6::R6Class(
                         # Ensure phi_mean corresponds to the original training data order
                         if(length(phi_mean) == nrow(self$data_with_re)) {
                             # Map the nearest training index to its spatial effect
-                            eta_spatial[valid_test_coords] <- phi_mean[original_train_indices]
-                            eta_spatial[!valid_test_coords] <- 0 # Assign 0 if coords were NA
-                            cat("Applied nearest neighbor spatial effect (phi) approximation for CARBayes prediction on new data.\n")
+                            eta_spatial <- phi_mean[original_train_indices]
+                            eta_spatial[is.na(eta_spatial)] <- 0 # Handle potential NAs
+                            cat("Applied nearest neighbor spatial effect approximation for CARBayes prediction.\n")
                         } else {
-                            warning("Could not apply NN spatial effect (phi): Mismatch between phi length and training data size.")
+                            warning("Could not apply nearest neighbor spatial effect: Mismatch between spatial effects length and training data size.")
                         }
                     } else {
-                        warning("Could not apply NN spatial effect (phi): No valid coordinates found in training or test data.")
+                        warning("Could not apply NN spatial effect: No valid coordinates found in training or test data.")
                     }
                 } else {
-                    warning("Could not apply NN spatial effect (phi): Coordinate columns missing or training data unavailable.")
+                    warning("Could not apply NN spatial effect: Coordinate columns missing or training data unavailable.")
                 }
             }
         } else {
             warning("Spatial random effect samples (phi) not found in CARBayes results.")
         }
         # --- End Spatial random effects ---
+
 
         # Add spatial effect to linear predictor (eta)
         # Ensure dimensions match before adding, handle NAs in eta
@@ -508,59 +509,75 @@ train_poisson_sem <- function(formula, train_data, val_data, fold_weights) {
 }
 
 # Combined cross-validation function for CARBayes, SEM, and INLA models
-# MODIFIED to use predefined borough folds instead of k-means blocks
+# MODIFIED for Stratified 5-Fold CV across districts
 run_combined_cross_validation <- function(data, response_var = "acc", random_effect = "borough", max_features = 30) {
   set.seed(42)
+  k <- 5 # Define the number of folds
 
-  # --- Define Borough-Based Folds ---
-  # THIS MAPPING NOW USES THE FINAL BOROUGH/ZONE NAMES PRESENT *AFTER* load_and_prepare_data
-  borough_to_fold <- list(
-    `1` = c('Zone est', 'Montréal-Nord', 'Saint-Léonard', 'Mercier-Hochelaga-Maisonneuve'), # Includes original RDP-PAT, MTL-Est, Anjou via Zone est
-    `2` = c('Zone centre', 'Rosemont-La-Petite-Patrie', 'Villeray-Saint-Michel-Parc-Extension'), # Includes original Outremont, Mont-Royal via Zone centre
-    `3` = c('Plateau-Mont-Royal', 'Ville-Marie'), # These were not mapped to zones
-    `4` = c('Zone ouest', 'Ahuntsic-Cartierville', 'Saint-Laurent'), # Includes original Kirkland, Beaconsfield, IB-SG, P-R, DDO, Dorval via Zone ouest
-    `5` = c('Zone sud', 'Zone centre-sud') # Includes original SO, CSL, Verdun, Lasalle, Lachine via Zone sud AND CDN-NDG, Hampstead, Westmount via Zone centre-sud
+  # --- Define District Mapping (Used for Stratification) ---
+  # This mapping uses the final borough/zone names present *AFTER* load_and_prepare_data
+  borough_to_district <- list(
+    `1` = c('Zone est', 'Montréal-Nord', 'Saint-Léonard', 'Mercier-Hochelaga-Maisonneuve'),
+    `2` = c('Zone centre', 'Rosemont-La-Petite-Patrie', 'Villeray-Saint-Michel-Parc-Extension'),
+    `3` = c('Plateau-Mont-Royal', 'Ville-Marie'),
+    `4` = c('Zone ouest', 'Ahuntsic-Cartierville', 'Saint-Laurent'),
+    `5` = c('Zone sud', 'Zone centre-sud')
   )
-  k <- length(borough_to_fold) # Number of folds is defined by the mapping
+  num_districts <- length(borough_to_district) # Should also be 5 in this case
 
   if (!random_effect %in% colnames(data)) {
-      stop(paste("Error: The specified random effect column '", random_effect, "' (used for folding) does not exist in the data.", sep=""))
+      stop(paste("Error: The specified random effect column '", random_effect, "' (used for district assignment) does not exist in the data.", sep=""))
   }
   # Ensure the column is a factor AFTER potential modifications in load_and_prepare_data
   if (!is.factor(data[[random_effect]])) {
       data[[random_effect]] <- as.factor(data[[random_effect]])
-      cat("Converting borough/zone column to factor for fold assignment.\n")
+      cat("Converting borough/zone column to factor for district assignment.\n")
   }
 
-  data$fold_id <- NA_integer_ # Initialize fold ID column
+  data$district_id <- NA_integer_ # Initialize district ID column
 
-  # Assign folds based on the potentially modified borough/zone names
-  for (fold_num in names(borough_to_fold)) {
-      boroughs_in_fold <- borough_to_fold[[fold_num]]
-      # Match against the borough column which might contain original names OR zone names
-      data$fold_id[data[[random_effect]] %in% boroughs_in_fold] <- as.integer(fold_num)
+  # Assign district IDs based on the potentially modified borough/zone names
+  for (district_num in names(borough_to_district)) {
+      boroughs_in_district <- borough_to_district[[district_num]]
+      data$district_id[data[[random_effect]] %in% boroughs_in_district] <- as.integer(district_num)
   }
 
-  # Check for unassigned data points (should be fewer or none now)
-  unassigned_count <- sum(is.na(data$fold_id))
+  # Check for unassigned data points
+  unassigned_count <- sum(is.na(data$district_id))
   if (unassigned_count > 0) {
-      unassigned_boroughs <- unique(data[[random_effect]][is.na(data$fold_id)])
-      cat(sprintf("Warning: %d data points could not be assigned to a fold. Unassigned boroughs/zones: %s\n",
+      unassigned_boroughs <- unique(data[[random_effect]][is.na(data$district_id)])
+      cat(sprintf("Warning: %d data points could not be assigned to a district. Unassigned boroughs/zones: %s\n",
                   unassigned_count, paste(unassigned_boroughs, collapse=", ")))
-      # Option 1: Stop execution
-      # stop("Cannot proceed with unassigned boroughs/zones.")
-      # Option 2: Remove unassigned data (used here)
       cat("Removing unassigned data points from the analysis.\n")
-      data <- data[!is.na(data$fold_id), ]
+      data <- data[!is.na(data$district_id), ]
       if(nrow(data) == 0) stop("No data remaining after removing unassigned points.")
   }
-  data$fold_id <- as.factor(data$fold_id) # Convert to factor for consistency
-  cat("Borough-based folds created with the following distribution:\n")
-  print(table(data$fold_id))
+  data$district_id <- as.factor(data$district_id) # Convert to factor
+  cat("District assignments created with the following distribution:\n")
+  print(table(data$district_id))
   # ------------------------------------
 
-  # --- Generate Map of Folds (Moved Here) ---
-  cat("\nGenerating map of cross-validation folds...\n")
+  # --- Create Stratified Folds (Parts) ---
+  cat("\nCreating stratified 5-fold assignments (parts)...\n")
+  set.seed(123) # Seed for reproducibility of fold assignment
+  data <- data %>%
+    group_by(district_id) %>%
+    # Randomly assign each intersection within a district to one of 5 parts
+    mutate(part_id = sample(cut(seq(1,n()), breaks = k, labels = FALSE))) %>%
+    # Alternative using ntile after shuffling:
+    # mutate(part_id = ntile(runif(n()), k)) %>%
+    ungroup()
+
+  data$part_id <- as.factor(data$part_id) # Ensure part_id is a factor
+  cat("Distribution of intersections across parts (folds):\n")
+  print(table(data$part_id))
+  cat("Distribution of intersections across parts within districts:\n")
+  print(table(District = data$district_id, Part = data$part_id))
+  # ------------------------------------
+
+
+  # --- Generate Map of Folds/Parts (Optional Visualization) ---
+  cat("\nGenerating map of cross-validation part assignments...\n")
 
   # --- FIX: Ensure unique column names before plotting ---
   if(any(duplicated(colnames(data)))) {
@@ -572,51 +589,45 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
   }
   # --- END FIX ---
 
-
   # Ensure ggplot2 is loaded
   if (!require(ggplot2)) {
     install.packages("ggplot2")
     library(ggplot2)
   }
 
-  # Use the 'data' object directly as it now contains the fold_id and has unique colnames
-  if ("fold_id" %in% colnames(data) && "x" %in% colnames(data) && "y" %in% colnames(data)) {
+  # Use the 'data' object directly as it now contains the part_id
+  if ("part_id" %in% colnames(data) && "x" %in% colnames(data) && "y" %in% colnames(data)) {
 
-    # Ensure fold_id is a factor for discrete coloring (already done above, but safe to double-check)
-    if (!is.factor(data$fold_id)) {
-      data$fold_id <- as.factor(data$fold_id)
+    # Ensure part_id is a factor for discrete coloring
+    if (!is.factor(data$part_id)) {
+      data$part_id <- as.factor(data$part_id)
     }
 
-    fold_map_plot <- ggplot(data, aes(x = x, y = y, color = fold_id)) + # Use 'data' directly
+    part_map_plot <- ggplot(data, aes(x = x, y = y, color = part_id)) + # Use 'data' directly, color by part_id
       geom_point(size = 0.5, alpha = 0.7) +
-      scale_color_viridis_d(name = "CV Fold") +
+      scale_color_viridis_d(name = "CV Part (Fold)") + # Update legend title
       labs(
-        title = "Map of Intersections by Cross-Validation Fold Assignment",
+        title = "Map of Intersections by Stratified CV Part Assignment", # Update title
         x = "X Coordinate",
         y = "Y Coordinate"
       ) +
-      theme_minimal() + # Start with minimal theme
+      theme_minimal() +
       theme(
          plot.title = element_text(hjust = 0.5),
          legend.position = "bottom",
-         # --- Add white background ---
-         plot.background = element_rect(fill = "white", colour = NA), # Overall plot background
-         panel.background = element_rect(fill = "white", colour = "grey90") # Panel background (optional light grey border)
-         # panel.grid.major = element_line(colour = "grey90"), # Uncomment if you want light grid lines
-         # panel.grid.minor = element_blank() # Uncomment to remove minor grid lines if major are added
-         # --- End white background ---
+         plot.background = element_rect(fill = "white", colour = NA),
+         panel.background = element_rect(fill = "white", colour = "grey90")
       ) +
       coord_fixed()
 
-    # Print the plot to the R graphics device
-    print(fold_map_plot)
+    print(part_map_plot) # Print the plot
 
     # Save the plot
-    ggsave("cv_fold_map_assignment.png", fold_map_plot, width = 8, height = 8) # Changed filename slightly
-    cat("Fold assignment map saved as 'cv_fold_map_assignment.png'\n")
+    ggsave("cv_stratified_part_map_assignment.png", part_map_plot, width = 8, height = 8) # Update filename
+    cat("Part assignment map saved as 'cv_stratified_part_map_assignment.png'\n")
 
   } else {
-    cat("Could not generate fold map: Required columns ('x', 'y', 'fold_id') not found in the data after handling duplicates.\n")
+    cat("Could not generate part map: Required columns ('x', 'y', 'part_id') not found in the data after handling duplicates.\n")
   }
   # --- End Map Generation ---
 
@@ -645,13 +656,15 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
 
   feature_formulas <- list()
 
-  # --- Borough-Based Fold Cross-Validation Loop ---
-  for (i in 1:k) { # Iterate through the defined number of folds
-    cat(sprintf("\n========== Processing Fold %d (Testing Fold %d) ==========\n", i, i))
-    test_idx <- which(data$fold_id == i)
-    train_idx <- which(data$fold_id != i)
+  # --- Stratified 5-Fold Cross-Validation Loop ---
+  for (i in 1:k) { # Iterate through the 5 folds/parts
+    cat(sprintf("\n========== Processing Fold %d (Testing Part %d) ==========\n", i, i))
+    # Test set = all intersections assigned to part 'i'
+    test_idx <- which(data$part_id == i)
+    # Training set = all intersections NOT assigned to part 'i'
+    train_idx <- which(data$part_id != i)
 
-    # Handle cases where a fold might be empty (less likely with predefined folds but good practice)
+    # Handle cases where a fold might be empty (unlikely with stratification but good practice)
     if (length(train_idx) == 0 || length(test_idx) == 0) {
         cat("Skipping fold", i, "due to empty train or test set.\n")
         # Assign NAs appropriately if skipping
@@ -672,7 +685,8 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     test_data <- data[test_idx, ]
 
     # --- Feature Selection (using LASSO on training data) ---
-    exclude_cols <- c('int_no', 'acc', 'pi', 'borough', 'x', 'y', 'idx_spatial', 'fold_id') # Exclude fold_id
+    # Exclude part_id and district_id as well
+    exclude_cols <- c('int_no', 'acc', 'pi', 'borough', 'x', 'y', 'idx_spatial', 'district_id', 'part_id')
     feature_cols <- setdiff(colnames(train_data), exclude_cols)
 
     # Ensure feature columns actually exist after exclusions
@@ -702,71 +716,110 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     feature_formulas[[i]] <- formula_str
     formula <- as.formula(formula_str)
 
+
     # --- Train CARBayes model ---
     cat("--- Training CARBayes Model ---\n")
     # Create spatial weights ONLY from training data
-    W_train_car <- create_spatial_weights(train_data[, c('x', 'y')], k_neighbors = 3)
-
-    carbayes <- carbayes_model$new(
-      data = train_data, # Use training data
-      formula = formula_str,
-      random_effect = random_effect, # Still pass random effect if needed by model internals
-      exposure = NULL,
-      spatial_vars = c('x', 'y')
-    )
-    # Explicitly set the training weights before fitting
-    carbayes$W <- W_train_car
-
-    carbayes_results <- try(carbayes$fit(), silent = TRUE)
-
-    if (inherits(carbayes_results, "try-error")) {
-        cat("ERROR fitting CARBayes model for fold", i, ":", attr(carbayes_results, "condition")$message, "\n")
-        carbayes_test_preds <- rep(NA, nrow(test_data))
-        carbayes_train_mae <- NA; carbayes_train_mse <- NA; carbayes_train_rmse <- NA # Train metrics not calculated here
-        carbayes_test_mae <- NA; carbayes_test_mse <- NA; carbayes_test_rmse <- NA
+    # Check for sufficient points and valid coordinates before creating weights
+    if(nrow(train_data) > 3 && !any(is.na(train_data$x)) && !any(is.na(train_data$y))) {
+        W_train_car <- create_spatial_weights(train_data[, c('x', 'y')], k_neighbors = 3)
     } else {
-        # Predict on the spatially separate test data
-        carbayes_test_preds <- carbayes$predict(test_data)
+        cat("Warning: Insufficient data or NA coordinates in training set for CARBayes weights. Skipping CARBayes for fold", i, "\n")
+        W_train_car <- NULL # Set weights to NULL
+    }
 
-        # Calculate metrics for CARBayes on the test set
-        carbayes_test_mae <- mean(abs(test_data[[response_var]] - carbayes_test_preds), na.rm = TRUE)
-        carbayes_test_mse <- mean((test_data[[response_var]] - carbayes_test_preds)^2, na.rm = TRUE)
-        carbayes_test_rmse <- sqrt(carbayes_test_mse)
-        cat(sprintf("CARBayes Fold %d: Test MAE = %.4f, RMSE = %.4f\n", i, carbayes_test_mae, carbayes_test_rmse))
+    # Only proceed if weights could be created
+    if (!is.null(W_train_car)) {
+        carbayes <- carbayes_model$new(
+          data = train_data, # Use training data
+          formula = formula_str,
+          random_effect = random_effect, # Still pass random effect if needed by model internals
+          exposure = NULL,
+          spatial_vars = c('x', 'y')
+        )
+        # Explicitly set the training weights before fitting
+        carbayes$W <- W_train_car
 
-        # Train metrics (optional, requires predicting on train_data)
-        carbayes_train_mae <- NA; carbayes_train_mse <- NA; carbayes_train_rmse <- NA # Set to NA if not calculated
+        carbayes_results <- try(carbayes$fit(), silent = TRUE)
+
+        if (inherits(carbayes_results, "try-error")) {
+            cat("ERROR fitting CARBayes model for fold", i, ":", attr(carbayes_results, "condition")$message, "\n")
+            carbayes_test_preds <- rep(NA, nrow(test_data))
+            carbayes_test_mae <- NA; carbayes_test_mse <- NA; carbayes_test_rmse <- NA
+        } else {
+            # Predict on the test data (which is now mixed spatially)
+            carbayes_test_preds <- carbayes$predict(test_data)
+
+            # Calculate metrics for CARBayes on the test set
+            carbayes_test_mae <- mean(abs(test_data[[response_var]] - carbayes_test_preds), na.rm = TRUE)
+            carbayes_test_mse <- mean((test_data[[response_var]] - carbayes_test_preds)^2, na.rm = TRUE)
+            carbayes_test_rmse <- sqrt(carbayes_test_mse)
+            cat(sprintf("CARBayes Fold %d: Test MAE = %.4f, RMSE = %.4f\n", i, carbayes_test_mae, carbayes_test_rmse))
+        }
+    } else {
+        # Handle case where weights couldn't be created
+        carbayes_results <- NULL # Ensure results object is NULL
+        carbayes_test_preds <- rep(NA, nrow(test_data))
+        carbayes_test_mae <- NA; carbayes_test_mse <- NA; carbayes_test_rmse <- NA
     }
 
 
     # --- Train SEM Poisson model ---
     cat("--- Training SEM Poisson Model ---\n")
     # Create spatial data objects for train/test
-    train_sp <- train_data
-    coordinates(train_sp) <- ~ x + y
-    test_sp <- test_data
-    coordinates(test_sp) <- ~ x + y
+    # Check for valid coordinates before creating spatial objects
+    if(!any(is.na(train_data$x)) && !any(is.na(train_data$y)) && nrow(train_data) > 0) {
+        train_sp <- train_data
+        coordinates(train_sp) <- ~ x + y
+    } else {
+        cat("Warning: NA coordinates or empty training data for SEM spatial object creation. Skipping SEM for fold", i, "\n")
+        train_sp <- NULL
+    }
+    if(!any(is.na(test_data$x)) && !any(is.na(test_data$y)) && nrow(test_data) > 0) {
+        test_sp <- test_data
+        coordinates(test_sp) <- ~ x + y
+    } else {
+        cat("Warning: NA coordinates or empty test data for SEM spatial object creation. Skipping SEM prediction for fold", i, "\n")
+        test_sp <- NULL
+    }
+
 
     # Create spatial weights ONLY from training data for SEM model fitting
-    w_train_sem <- make_spatial_weights_for_sem(train_sp, k = 3)
-
-    sem_test_preds <- try(train_poisson_sem(
-      formula = formula, # Use the formula object based on selected features
-      train_data = train_sp,
-      val_data = test_sp,
-      fold_weights = w_train_sem # Use only training weights
-    ), silent = TRUE)
-
-    if (inherits(sem_test_preds, "try-error") || any(is.na(sem_test_preds)) || length(sem_test_preds) != nrow(test_data)) {
-        cat("ERROR or NA/length mismatch in SEM model prediction for fold", i, "\n")
-        sem_test_mae <- NA; sem_test_mse <- NA; sem_test_rmse <- NA
-        sem_test_preds <- rep(NA, nrow(test_data)) # Ensure correct length for storage
+    if (!is.null(train_sp) && nrow(train_sp) > 3) { # Need k+1 points for k=3 neighbors
+        w_train_sem <- tryCatch(make_spatial_weights_for_sem(train_sp, k = 3),
+                                error = function(e) {
+                                    cat("Warning: Could not create SEM weights for fold", i, ":", e$message, "\n")
+                                    return(NULL)
+                                })
     } else {
-        # Calculate metrics for SEM Poisson
-        sem_test_mae <- mean(abs(test_data[[response_var]] - sem_test_preds), na.rm = TRUE)
-        sem_test_mse <- mean((test_data[[response_var]] - sem_test_preds)^2, na.rm = TRUE)
-        sem_test_rmse <- sqrt(sem_test_mse)
-        cat(sprintf("SEM Fold %d: Test MAE = %.4f, RMSE = %.4f\n", i, sem_test_mae, sem_test_rmse))
+        w_train_sem <- NULL
+    }
+
+    # Only proceed if weights and spatial objects are valid
+    if (!is.null(w_train_sem) && !is.null(train_sp) && !is.null(test_sp)) {
+        sem_test_preds <- try(train_poisson_sem(
+          formula = formula, # Use the formula object based on selected features
+          train_data = train_sp,
+          val_data = test_sp,
+          fold_weights = w_train_sem # Use only training weights
+        ), silent = TRUE)
+
+        if (inherits(sem_test_preds, "try-error") || any(is.na(sem_test_preds)) || length(sem_test_preds) != nrow(test_data)) {
+            cat("ERROR or NA/length mismatch in SEM model prediction for fold", i, "\n")
+            sem_test_mae <- NA; sem_test_mse <- NA; sem_test_rmse <- NA
+            # Ensure preds vector has correct length even if prediction failed
+            sem_test_preds <- rep(NA, nrow(test_data))
+        } else {
+            # Calculate metrics for SEM Poisson
+            sem_test_mae <- mean(abs(test_data[[response_var]] - sem_test_preds), na.rm = TRUE)
+            sem_test_mse <- mean((test_data[[response_var]] - sem_test_preds)^2, na.rm = TRUE)
+            sem_test_rmse <- sqrt(sem_test_mse)
+            cat(sprintf("SEM Fold %d: Test MAE = %.4f, RMSE = %.4f\n", i, sem_test_mae, sem_test_rmse))
+        }
+    } else {
+        # Handle case where SEM couldn't be run
+        sem_test_preds <- rep(NA, nrow(test_data))
+        sem_test_mae <- NA; sem_test_mse <- NA; sem_test_rmse <- NA
     }
 
 
@@ -778,187 +831,207 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     train_data_inla$idx_train_spatial <- 1:nrow(train_data_inla)
 
     # Create sparse spatial weights matrix ONLY from training data
-    coords_train_inla <- as.matrix(train_data_inla[, c('x', 'y')])
-    W_dense_train_inla <- create_spatial_weights(data.frame(x=coords_train_inla[,1], y=coords_train_inla[,2]), k_neighbors=3)
-    W_sparse_train_inla <- Matrix(W_dense_train_inla, sparse = TRUE)
-    # Ensure the graph matrix dimensions match the training data size
-    if(nrow(W_sparse_train_inla) != nrow(train_data_inla)) {
-         stop("Dimension mismatch between training data and spatial weights matrix for INLA.")
+    # Check for sufficient points and valid coordinates
+    W_sparse_train_inla <- NULL # Initialize as NULL
+    if(nrow(train_data_inla) > 3 && !any(is.na(train_data_inla$x)) && !any(is.na(train_data_inla$y))) {
+        coords_train_inla <- as.matrix(train_data_inla[, c('x', 'y')])
+        W_dense_train_inla <- tryCatch(create_spatial_weights(data.frame(x=coords_train_inla[,1], y=coords_train_inla[,2]), k_neighbors=3),
+                                       error = function(e) {
+                                           cat("Warning: Could not create dense weights for INLA in fold", i, ":", e$message, "\n")
+                                           return(NULL)
+                                       })
+        if (!is.null(W_dense_train_inla)) {
+            W_sparse_train_inla <- Matrix(W_dense_train_inla, sparse = TRUE)
+            # Ensure the graph matrix dimensions match the training data size
+            if(nrow(W_sparse_train_inla) != nrow(train_data_inla)) {
+                 cat("Warning: Dimension mismatch between training data and spatial weights matrix for INLA. Skipping INLA for fold", i, "\n")
+                 W_sparse_train_inla <- NULL # Invalidate weights
+            }
+        }
+    } else {
+        cat("Warning: Insufficient data or NA coordinates in training set for INLA weights. Skipping INLA for fold", i, "\n")
     }
 
-    # Construct INLA formula using training index and weights
-    # Ensure random_effect column exists and is a factor in train_data_inla
-     if (!is.factor(train_data_inla[[random_effect]])) {
-          # Use levels from the full data factor to handle all possible levels
-          if(is.factor(data[[random_effect]])) {
-              train_data_inla[[random_effect]] <- factor(train_data_inla[[random_effect]], levels = levels(data[[random_effect]]))
-          } else { # Fallback if original wasn't factor (shouldn't happen due to earlier check)
-              train_data_inla[[random_effect]] <- factor(train_data_inla[[random_effect]])
-          }
-     }
-     # Ensure test data also has factor levels consistent with training data
-     # Use levels from the full data's factor to handle all possible levels
-     if(is.factor(data[[random_effect]])) {
-         all_levels <- levels(data[[random_effect]])
-         # train_data_inla[[random_effect]] <- factor(train_data_inla[[random_effect]], levels = all_levels) # Already done above
-         test_data[[random_effect]] <- factor(test_data[[random_effect]], levels = all_levels)
-     } else { # Fallback if original wasn't factor (shouldn't happen due to earlier check)
-         test_data[[random_effect]] <- factor(test_data[[random_effect]], levels = levels(train_data_inla[[random_effect]]))
-     }
+
+    # Only proceed if INLA weights are valid
+    if (!is.null(W_sparse_train_inla)) {
+        # Construct INLA formula using training index and weights
+        # Ensure random_effect column exists and is a factor in train_data_inla
+         if (!is.factor(train_data_inla[[random_effect]])) {
+              # Use levels from the full data factor to handle all possible levels
+              if(is.factor(data[[random_effect]])) {
+                  train_data_inla[[random_effect]] <- factor(train_data_inla[[random_effect]], levels = levels(data[[random_effect]]))
+              } else { # Fallback if original wasn't factor
+                  train_data_inla[[random_effect]] <- factor(train_data_inla[[random_effect]])
+              }
+         }
+         # Ensure test data also has factor levels consistent with training data
+         if(is.factor(data[[random_effect]])) {
+             all_levels <- levels(data[[random_effect]])
+             test_data[[random_effect]] <- factor(test_data[[random_effect]], levels = all_levels)
+         } else { # Fallback
+             test_data[[random_effect]] <- factor(test_data[[random_effect]], levels = levels(train_data_inla[[random_effect]]))
+         }
 
 
-    inla_formula_str <- paste(
-        response_var, "~", formula_str_base, # Use base formula (features or intercept)
-        "+ f(idx_train_spatial, model = 'bym2', graph = W_sparse_train_inla, scale.model = TRUE, constr = TRUE, hyper = list(prec = pc_prec_unstructured, phi = pc_phi))",
-        "+ f(", random_effect, ", model = 'iid', hyper = list(prec = pc_prec_borough))"
-    )
-    inla_formula <- as.formula(inla_formula_str)
+        inla_formula_str <- paste(
+            response_var, "~", formula_str_base, # Use base formula (features or intercept)
+            "+ f(idx_train_spatial, model = 'bym2', graph = W_sparse_train_inla, scale.model = TRUE, constr = TRUE, hyper = list(prec = pc_prec_unstructured, phi = pc_phi))",
+            "+ f(", random_effect, ", model = 'iid', hyper = list(prec = pc_prec_borough))"
+        )
+        inla_formula <- as.formula(inla_formula_str)
 
-    # Fit INLA model ONLY on training data
-    inla_model <- try(inla(inla_formula,
-                           data = train_data_inla, # Use training data
-                           family = "nbinomial",
-                           # Add compute=TRUE for predictor to get spatial effects easily
-                           control.predictor = list(compute = TRUE, link = 1),
-                           control.compute = list(dic = TRUE, waic = TRUE, config = TRUE, return.marginals.predictor=FALSE), # Save memory
-                           control.family = nb_family_control,
-                           control.mode = inla_control_mode,
-                           # verbose = TRUE # Keep FALSE for cleaner CV output
-                           ),
-                      silent = TRUE)
+        # Fit INLA model ONLY on training data
+        inla_model <- try(inla(inla_formula,
+                               data = train_data_inla, # Use training data
+                               family = "nbinomial",
+                               # Add compute=TRUE for predictor to get spatial effects easily
+                               control.predictor = list(compute = TRUE, link = 1),
+                               control.compute = list(dic = TRUE, waic = TRUE, config = TRUE, return.marginals.predictor=FALSE), # Save memory
+                               control.family = nb_family_control,
+                               control.mode = inla_control_mode,
+                               # verbose = TRUE # Keep FALSE for cleaner CV output
+                               ),
+                          silent = TRUE)
 
-    if (inherits(inla_model, "try-error")) {
-        cat("ERROR fitting INLA model for fold", i, ":", attr(inla_model, "condition")$message, "\n")
+        if (inherits(inla_model, "try-error")) {
+            cat("ERROR fitting INLA model for fold", i, ":", attr(inla_model, "condition")$message, "\n")
+            inla_test_preds <- rep(NA, nrow(test_data))
+            inla_test_mae <- NA; inla_test_mse <- NA; inla_test_rmse <- NA
+        } else {
+            # --- Predict INLA manually for the test set ---
+            # Build model matrix for fixed effects for the test data
+            fixed_effects_formula <- as.formula(paste("~", formula_str_base))
+            # Ensure factor levels in test_data match those used in training for model.matrix
+            for(col in selected_features) {
+                 if(is.factor(train_data_inla[[col]])) {
+                      # Use levels from the full data factor if available
+                      if(is.factor(data[[col]])) {
+                          test_data[[col]] <- factor(test_data[[col]], levels=levels(data[[col]]))
+                      } else {
+                          test_data[[col]] <- factor(test_data[[col]], levels=levels(train_data_inla[[col]]))
+                      }
+                 }
+            }
+            # Random effect factor levels already handled before INLA formula creation
+
+            X_test <- model.matrix(fixed_effects_formula, data = test_data)
+
+            # Get mean coefficients for fixed effects
+            beta_mean <- inla_model$summary.fixed$mean
+
+            # Ensure alignment between coefficients and model matrix columns
+            if (length(beta_mean) != ncol(X_test)) {
+                 # This might happen if LASSO selected 0 features -> intercept only
+                 if ("(Intercept)" %in% colnames(X_test) && "(Intercept)" %in% names(beta_mean)) {
+                     common_cols <- intersect(colnames(X_test), names(beta_mean))
+                     X_test <- X_test[, common_cols, drop = FALSE]
+                     beta_mean <- beta_mean[common_cols]
+                 } else {
+                     cat("Warning: Mismatch between INLA fixed effects and test data model matrix columns. Prediction might be inaccurate.\n")
+                     # Attempt to align, otherwise predict NA
+                     common_cols <- intersect(colnames(X_test), names(beta_mean))
+                     if(length(common_cols) > 0) {
+                        X_test <- X_test[, common_cols, drop = FALSE]
+                        beta_mean <- beta_mean[common_cols]
+                     } else {
+                        X_test <- matrix(0, nrow=nrow(test_data), ncol=0) # Predict NA later
+                     }
+                 }
+            } else {
+                 # Ensure order matches if names are present
+                 if(all(colnames(X_test) %in% names(beta_mean))) {
+                     beta_mean <- beta_mean[colnames(X_test)]
+                 } else {
+                     cat("Warning: Column names mismatch between INLA fixed effects and test matrix, assuming order is correct.\n")
+                 }
+            }
+
+            # Calculate fixed effects contribution to linear predictor
+            if(ncol(X_test) > 0 && length(beta_mean) == ncol(X_test)) { # Check alignment before multiplication
+                eta_fixed <- X_test %*% beta_mean
+            } else if ("(Intercept)" %in% names(beta_mean) && ncol(X_test) == 1 && colnames(X_test) == "(Intercept)") {
+                 # Handle intercept-only case explicitly
+                 eta_fixed <- X_test %*% beta_mean["(Intercept)"]
+            } else if (length(selected_features) == 0 && "(Intercept)" %in% names(beta_mean)) {
+                 # Handle case where LASSO selected 0 features, formula was ~ 1
+                 eta_fixed <- rep(beta_mean["(Intercept)"], nrow(test_data))
+            }
+             else {
+                cat("Warning: Could not align fixed effects for INLA prediction in fold", i, ". Setting fixed effect contribution to 0.\n")
+                eta_fixed <- rep(0, nrow(test_data))
+            }
+
+
+            # Get mean random effects for borough
+            re_summary <- inla_model$summary.random[[random_effect]]
+            re_map <- setNames(re_summary$mean, re_summary$ID)
+            eta_random <- re_map[as.character(test_data[[random_effect]])]
+            eta_random[is.na(eta_random)] <- 0 # Use 0 for levels not in training summary
+
+            # --- Approximate Spatial Effect using Nearest Neighbor ---
+            eta_spatial_approx <- rep(0, nrow(test_data)) # Initialize with 0
+            if (!is.null(inla_model$summary.random$idx_train_spatial) &&
+                !any(is.na(train_data_inla$x)) && !any(is.na(train_data_inla$y)) &&
+                !any(is.na(test_data$x)) && !any(is.na(test_data$y))) {
+                # Get coordinates of training and test data
+                coords_train <- train_data_inla[, c("x", "y")]
+                coords_test <- test_data[, c("x", "y")]
+
+                # Find the index of the nearest training point for each test point
+                nn_result <- FNN::get.knnx(coords_train, coords_test, k = 1)
+                nearest_train_indices <- nn_result$nn.index[, 1]
+
+                # Get the fitted spatial effects (combined BYM2 effect) for training points
+                spatial_effects_train <- inla_model$summary.random$idx_train_spatial$mean
+
+                # Ensure lengths match before indexing
+                if(length(spatial_effects_train) == nrow(train_data_inla)) {
+                     # Map the nearest training index to its spatial effect
+                     eta_spatial_approx <- spatial_effects_train[nearest_train_indices]
+                     eta_spatial_approx[is.na(eta_spatial_approx)] <- 0 # Handle potential NAs
+                     cat("Applied nearest neighbor spatial effect approximation for INLA prediction.\n")
+                } else {
+                     warning("Could not apply nearest neighbor spatial effect: Mismatch between spatial effects length and training data size.")
+                }
+            } else {
+                 warning("Spatial random effect 'idx_train_spatial' not found, or NA coordinates present. Skipping NN spatial effect approximation.")
+            }
+            # --- End Spatial Effect Approximation ---
+
+
+            # Combine fixed, random (borough), and approximated spatial effects
+            eta_test <- eta_fixed + eta_random + eta_spatial_approx # Add spatial approx
+
+            # Apply inverse link function (exponential for Poisson/NB log link)
+            inla_test_preds <- exp(eta_test)
+            # Impute NAs with mean of training response if any step failed leading to NA eta
+            na_preds <- is.na(inla_test_preds)
+            if(any(na_preds)) {
+                inla_test_preds[na_preds] <- mean(train_data_inla[[response_var]], na.rm = TRUE)
+                cat("Imputed", sum(na_preds), "NA predictions in INLA with training mean.\n")
+            }
+
+
+            # Calculate metrics for INLA
+            inla_test_mae <- mean(abs(test_data[[response_var]] - inla_test_preds), na.rm = TRUE)
+            inla_test_mse <- mean((test_data[[response_var]] - inla_test_preds)^2, na.rm = TRUE)
+            inla_test_rmse <- sqrt(inla_test_mse)
+            cat(sprintf("INLA Fold %d: Test MAE = %.4f, RMSE = %.4f\n", i, inla_test_mae, inla_test_rmse))
+        }
+    } else {
+        # Handle case where INLA weights were invalid
+        inla_model <- NULL # Ensure model object is NULL
         inla_test_preds <- rep(NA, nrow(test_data))
         inla_test_mae <- NA; inla_test_mse <- NA; inla_test_rmse <- NA
-    } else {
-        # --- Predict INLA manually for the test set ---
-        # Build model matrix for fixed effects for the test data
-        fixed_effects_formula <- as.formula(paste("~", formula_str_base))
-        # Ensure factor levels in test_data match those used in training for model.matrix
-        for(col in selected_features) {
-             if(is.factor(train_data_inla[[col]])) {
-                  # Use levels from the full data factor if available
-                  if(is.factor(data[[col]])) {
-                      test_data[[col]] <- factor(test_data[[col]], levels=levels(data[[col]]))
-                  } else {
-                      test_data[[col]] <- factor(test_data[[col]], levels=levels(train_data_inla[[col]]))
-                  }
-             }
-        }
-        # Random effect factor levels already handled before INLA formula creation
-
-        X_test <- model.matrix(fixed_effects_formula, data = test_data)
-
-        # Get mean coefficients for fixed effects
-        beta_mean <- inla_model$summary.fixed$mean
-
-        # Ensure alignment between coefficients and model matrix columns
-        if (length(beta_mean) != ncol(X_test)) {
-             # This might happen if LASSO selected 0 features -> intercept only
-             if ("(Intercept)" %in% colnames(X_test) && "(Intercept)" %in% names(beta_mean)) {
-                 common_cols <- intersect(colnames(X_test), names(beta_mean))
-                 X_test <- X_test[, common_cols, drop = FALSE]
-                 beta_mean <- beta_mean[common_cols]
-             } else {
-                 cat("Warning: Mismatch between INLA fixed effects and test data model matrix columns. Prediction might be inaccurate.\n")
-                 # Attempt to align, otherwise predict NA
-                 common_cols <- intersect(colnames(X_test), names(beta_mean))
-                 if(length(common_cols) > 0) {
-                    X_test <- X_test[, common_cols, drop = FALSE]
-                    beta_mean <- beta_mean[common_cols]
-                 } else {
-                    X_test <- matrix(0, nrow=nrow(test_data), ncol=0) # Predict NA later
-                 }
-             }
-        } else {
-             # Ensure order matches if names are present
-             if(all(colnames(X_test) %in% names(beta_mean))) {
-                 beta_mean <- beta_mean[colnames(X_test)]
-             } else {
-                 cat("Warning: Column names mismatch between INLA fixed effects and test matrix, assuming order is correct.\n")
-             }
-        }
-
-        # Calculate fixed effects contribution to linear predictor
-        if(ncol(X_test) > 0 && length(beta_mean) == ncol(X_test)) { # Check alignment before multiplication
-            eta_fixed <- X_test %*% beta_mean
-        } else if ("(Intercept)" %in% names(beta_mean) && ncol(X_test) == 1 && colnames(X_test) == "(Intercept)") {
-             # Handle intercept-only case explicitly
-             eta_fixed <- X_test %*% beta_mean["(Intercept)"]
-        } else if (length(selected_features) == 0 && "(Intercept)" %in% names(beta_mean)) {
-             # Handle case where LASSO selected 0 features, formula was ~ 1
-             eta_fixed <- rep(beta_mean["(Intercept)"], nrow(test_data))
-        }
-         else {
-            cat("Warning: Could not align fixed effects for INLA prediction in fold", i, ". Setting fixed effect contribution to 0.\n")
-            eta_fixed <- rep(0, nrow(test_data))
-        }
-
-
-        # Get mean random effects for borough
-        re_summary <- inla_model$summary.random[[random_effect]]
-        re_map <- setNames(re_summary$mean, re_summary$ID)
-        eta_random <- re_map[as.character(test_data[[random_effect]])]
-        eta_random[is.na(eta_random)] <- 0 # Use 0 for levels not in training summary
-
-        # --- Approximate Spatial Effect using Nearest Neighbor ---
-        eta_spatial_approx <- rep(0, nrow(test_data)) # Initialize with 0
-        if (!is.null(inla_model$summary.random$idx_train_spatial)) {
-            # Get coordinates of training and test data
-            coords_train <- train_data_inla[, c("x", "y")]
-            coords_test <- test_data[, c("x", "y")]
-
-            # Find the index of the nearest training point for each test point
-            nn_result <- FNN::get.knnx(coords_train, coords_test, k = 1)
-            nearest_train_indices <- nn_result$nn.index[, 1]
-
-            # Get the fitted spatial effects (combined BYM2 effect) for training points
-            # The summary is ordered by the internal index (1:nrow(train_data_inla))
-            spatial_effects_train <- inla_model$summary.random$idx_train_spatial$mean
-
-            # Ensure lengths match before indexing
-            if(length(spatial_effects_train) == nrow(train_data_inla)) {
-                 # Map the nearest training index to its spatial effect
-                 eta_spatial_approx <- spatial_effects_train[nearest_train_indices]
-                 eta_spatial_approx[is.na(eta_spatial_approx)] <- 0 # Handle potential NAs
-                 cat("Applied nearest neighbor spatial effect approximation for INLA prediction.\n")
-            } else {
-                 warning("Could not apply nearest neighbor spatial effect: Mismatch between spatial effects length and training data size.")
-            }
-        } else {
-             warning("Spatial random effect 'idx_train_spatial' not found in INLA model summary.")
-        }
-        # --- End Spatial Effect Approximation ---
-
-
-        # Combine fixed, random (borough), and approximated spatial effects
-        eta_test <- eta_fixed + eta_random + eta_spatial_approx # Add spatial approx
-
-        # Apply inverse link function (exponential for Poisson/NB log link)
-        inla_test_preds <- exp(eta_test)
-        # Impute NAs with mean of training response if any step failed leading to NA eta
-        na_preds <- is.na(inla_test_preds)
-        if(any(na_preds)) {
-            inla_test_preds[na_preds] <- mean(train_data_inla[[response_var]], na.rm = TRUE)
-            cat("Imputed", sum(na_preds), "NA predictions in INLA with training mean.\n")
-        }
-
-
-        # Calculate metrics for INLA
-        inla_test_mae <- mean(abs(test_data[[response_var]] - inla_test_preds), na.rm = TRUE)
-        inla_test_mse <- mean((test_data[[response_var]] - inla_test_preds)^2, na.rm = TRUE)
-        inla_test_rmse <- sqrt(inla_test_mse)
-        cat(sprintf("INLA Fold %d: Test MAE = %.4f, RMSE = %.4f\n", i, inla_test_mae, inla_test_rmse))
     }
 
 
     # --- Store results for the fold ---
     carbayes_fold_results[[i]] <- list(
       fold = i, # Use fold number
-      # train_mae = carbayes_train_mae, train_mse = carbayes_train_mse, train_rmse = carbayes_train_rmse, # Optional
       test_mae = carbayes_test_mae, test_mse = carbayes_test_mse, test_rmse = carbayes_test_rmse,
-      model_summary = if (!inherits(carbayes_results, "try-error")) summary(carbayes$results) else NULL,
+      model_summary = if (!is.null(carbayes_results)) summary(carbayes$results) else NULL, # Check if results exist
       selected_features = selected_features, formula = formula_str
     )
 
@@ -971,7 +1044,7 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     inla_fold_results[[i]] <- list(
       fold = i, # Use fold number
       test_mae = inla_test_mae, test_mse = inla_test_mse, test_rmse = inla_test_rmse,
-      model_summary = if (!inherits(inla_model, "try-error")) summary(inla_model) else NULL,
+      model_summary = if (!is.null(inla_model) && !inherits(inla_model, "try-error")) summary(inla_model) else NULL, # Check if model exists and is valid
       selected_features = selected_features, formula = formula_str
     )
 
@@ -983,7 +1056,7 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     sem_test_predicted[[i]] <- sem_test_preds
     inla_test_actual[[i]] <- test_data[[response_var]]
     inla_test_predicted[[i]] <- inla_test_preds
-  } # End of borough-based fold loop
+  } # End of stratified fold loop
 
   # --- Combine results and calculate overall metrics ---
   # Filter out potential NULLs if folds were skipped
@@ -1022,7 +1095,7 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
   # Feature consistency analysis (based on LASSO selection)
   valid_carbayes_results <- carbayes_fold_results[!sapply(carbayes_fold_results, function(x) is.null(x$selected_features))]
   all_features <- unique(unlist(lapply(valid_carbayes_results, function(x) x$selected_features)))
-  if (length(all_features) > 0) {
+  if (length(all_features) > 0 && length(valid_carbayes_results) > 0) { # Check if valid results exist
       feature_counts <- sapply(all_features, function(feat) {
         sum(sapply(valid_carbayes_results, function(x) feat %in% x$selected_features))
       })
@@ -1040,7 +1113,8 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
 
 
   return(list(
-    data_with_folds = data, # Return data with fold assignments
+    # Return data with district and part assignments
+    data_with_assignments = data, # Renamed from data_with_folds
     carbayes_results = list(
       fold_results = carbayes_fold_results,
       overall_mae = carbayes_overall_mae, overall_mse = carbayes_overall_mse, overall_rmse = carbayes_overall_rmse,
@@ -1063,20 +1137,22 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
   ))
 }
 
-# Generate figures from cross-validation results (Modified for Borough Folds)
-generate_cv_figures <- function(cv_results, data_with_folds) {
+# Generate figures from cross-validation results (Modified for Stratified CV)
+generate_cv_figures <- function(cv_results, data_with_assignments) { # Changed argument name
   # Figure 1: Map of predicted accidents (using CARBayes results as example)
 
-  # Ensure data_with_folds has the fold_id column used in cv_results
-  if (!"fold_id" %in% colnames(data_with_folds)) {
-      stop("`data_with_folds` must contain the 'fold_id' column.")
+  # Ensure data_with_assignments has the necessary columns
+  if (!all(c("x", "y", "acc", "int_no") %in% colnames(data_with_assignments))) {
+      stop("`data_with_assignments` must contain 'x', 'y', 'acc', and 'int_no' columns.")
   }
+  # part_id is useful for context but not strictly needed for matching predictions here
 
   all_predictions <- data.frame(
-    x = data_with_folds$x,
-    y = data_with_folds$y,
-    actual = data_with_folds$acc,
-    fold_id = data_with_folds$fold_id, # Use fold_id
+    x = data_with_assignments$x,
+    y = data_with_assignments$y,
+    actual = data_with_assignments$acc,
+    int_no = data_with_assignments$int_no, # Keep int_no for matching
+    # part_id = data_with_assignments$part_id, # Optional: keep for context
     predicted = NA_real_ # Initialize with numeric NA
   )
 
@@ -1084,17 +1160,18 @@ generate_cv_figures <- function(cv_results, data_with_folds) {
   pred_ids <- cv_results$carbayes_results$test_ids
   pred_values <- cv_results$carbayes_results$test_predicted
 
+  # Handle case where predictions might be NULL or empty
+  if (is.null(pred_ids) || is.null(pred_values) || length(pred_ids) == 0 || length(pred_values) == 0) {
+      warning("No CARBayes predictions available to generate figures.")
+      return(list(map_plot = NULL, scatter_plot = NULL, predictions = all_predictions)) # Return empty predictions df
+  }
+
+
   # Create a lookup table: prediction value for each int_no
   prediction_lookup <- setNames(pred_values, pred_ids)
 
   # Match predictions back to the all_predictions dataframe using int_no
-  # Ensure int_no exists in data_with_folds
-  if (!"int_no" %in% colnames(data_with_folds)) {
-      stop("`data_with_folds` must contain the 'int_no' column for matching predictions.")
-  }
-
-  # Find the indices in all_predictions that correspond to the predicted IDs
-  match_indices <- match(data_with_folds$int_no, pred_ids)
+  match_indices <- match(all_predictions$int_no, pred_ids)
 
   # Assign predictions where a match was found
   valid_match_indices <- !is.na(match_indices)
@@ -1105,7 +1182,7 @@ generate_cv_figures <- function(cv_results, data_with_folds) {
   plot_data <- all_predictions[!is.na(all_predictions$predicted), ]
 
   if(nrow(plot_data) == 0) {
-      warning("No valid predictions found to generate plots.")
+      warning("No valid predictions found after matching to generate plots.")
       return(list(map_plot = NULL, scatter_plot = NULL, predictions = plot_data))
   }
 
@@ -1122,6 +1199,7 @@ generate_cv_figures <- function(cv_results, data_with_folds) {
   }
 
   sp_predictions <- plot_data
+  map_plot <- NULL # Initialize map_plot as NULL
   tryCatch({
       coordinates(sp_predictions) <- ~ x + y
       # Convert to sf for better mapping
@@ -1138,11 +1216,11 @@ generate_cv_figures <- function(cv_results, data_with_folds) {
           legend.background = element_rect(fill = "white", color = NA),
           legend.position = "right"
         ) +
-        labs(title = "Map of Predicted Accidents (Borough Fold CV)", # Updated title
+        labs(title = "Map of Predicted Accidents (Stratified 5-Fold CV)", # Updated title
              subtitle = "CARBayes Model Cross-Validation Results")
   }, error = function(e){
        cat("Error creating spatial map plot:", e$message, "\n")
-       map_plot <<- NULL # Assign NULL in the upper environment
+       # map_plot remains NULL
   })
 
 
@@ -1157,7 +1235,7 @@ generate_cv_figures <- function(cv_results, data_with_folds) {
       plot.background = element_rect(fill = "white", color = NA),
       legend.background = element_rect(fill = "white", color = NA)
     ) +
-    labs(title = "Predicted vs Actual Accidents (Borough Fold CV)", # Updated title
+    labs(title = "Predicted vs Actual Accidents (Stratified 5-Fold CV)", # Updated title
          subtitle = "CARBayes Model Cross-Validation Results",
          x = "Actual Accidents",
          y = "Predicted Accidents")
@@ -1185,17 +1263,17 @@ if (!all(required_cols %in% colnames(full_data))) {
 }
 
 
-cat("Running combined borough-fold cross-validation...\n") # Updated message
-# k is determined internally by the borough mapping now
+cat("Running combined stratified 5-fold cross-validation...\n") # Updated message
+# k=5 is now defined inside the function
 cv_results <- run_combined_cross_validation(
   data = full_data,
   response_var = "acc",
-  random_effect = "borough",
+  random_effect = "borough", # Used for district stratification
   max_features = 10
 )
 
 # Retrieve the data with fold assignments for figure generation
-data_with_folds <- cv_results$data_with_folds # Renamed variable
+data_with_assignments <- cv_results$data_with_assignments # Renamed variable
 
 # Print Results (Ensure results exist before accessing)
 cat("\n==== CARBayes Model Results ====\n")
@@ -1204,8 +1282,9 @@ if (!is.null(cv_results$carbayes_results) && length(cv_results$carbayes_results$
     for (i in 1:length(cv_results$carbayes_results$fold_results)) {
       fold <- cv_results$carbayes_results$fold_results[[i]]
       if (!is.null(fold)) {
-           cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n", # Removed block_id reference
-                    fold$fold, fold$test_mae, fold$test_mse, fold$test_rmse))
+           # Use %||% NA to handle potential NA metrics within a fold result
+           cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n",
+                    fold$fold, fold$test_mae %||% NA, fold$test_mse %||% NA, fold$test_rmse %||% NA))
       }
     }
 
@@ -1218,9 +1297,9 @@ if (!is.null(cv_results$carbayes_results) && length(cv_results$carbayes_results$
     cat(sprintf("Mean MAE: %.4f\n", carbayes_mean_mae))
     cat(sprintf("Mean MSE: %.4f\n", carbayes_mean_mse))
     cat(sprintf("Mean RMSE: %.4f\n", carbayes_mean_rmse))
-    cat(sprintf("Overall MAE: %.4f\n", cv_results$carbayes_results$overall_mae))
-    cat(sprintf("Overall MSE: %.4f\n", cv_results$carbayes_results$overall_mse))
-    cat(sprintf("Overall RMSE: %.4f\n", cv_results$carbayes_results$overall_rmse))
+    cat(sprintf("Overall MAE: %.4f\n", cv_results$carbayes_results$overall_mae %||% NA)) # Use %||% NA for overall too
+    cat(sprintf("Overall MSE: %.4f\n", cv_results$carbayes_results$overall_mse %||% NA))
+    cat(sprintf("Overall RMSE: %.4f\n", cv_results$carbayes_results$overall_rmse %||% NA))
 } else {
     cat("CARBayes results are not available.\n")
     carbayes_mean_mae <- NA; carbayes_mean_mse <- NA; carbayes_mean_rmse <- NA # Set NAs for comparison table
@@ -1233,8 +1312,8 @@ if (!is.null(cv_results$sem_results) && length(cv_results$sem_results$fold_resul
      for (i in 1:length(cv_results$sem_results$fold_results)) {
       fold <- cv_results$sem_results$fold_results[[i]]
        if (!is.null(fold)) {
-           cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n", # Removed block_id reference
-                    fold$fold, fold$test_mae, fold$test_mse, fold$test_rmse))
+           cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n",
+                    fold$fold, fold$test_mae %||% NA, fold$test_mse %||% NA, fold$test_rmse %||% NA))
        }
     }
 
@@ -1246,9 +1325,9 @@ if (!is.null(cv_results$sem_results) && length(cv_results$sem_results$fold_resul
     cat(sprintf("Mean MAE: %.4f\n", sem_mean_mae))
     cat(sprintf("Mean MSE: %.4f\n", sem_mean_mse))
     cat(sprintf("Mean RMSE: %.4f\n", sem_mean_rmse))
-    cat(sprintf("Overall MAE: %.4f\n", cv_results$sem_results$overall_mae))
-    cat(sprintf("Overall MSE: %.4f\n", cv_results$sem_results$overall_mse))
-    cat(sprintf("Overall RMSE: %.4f\n", cv_results$sem_results$overall_rmse))
+    cat(sprintf("Overall MAE: %.4f\n", cv_results$sem_results$overall_mae %||% NA))
+    cat(sprintf("Overall MSE: %.4f\n", cv_results$sem_results$overall_mse %||% NA))
+    cat(sprintf("Overall RMSE: %.4f\n", cv_results$sem_results$overall_rmse %||% NA))
 } else {
     cat("SEM results are not available.\n")
     sem_mean_mae <- NA; sem_mean_mse <- NA; sem_mean_rmse <- NA
@@ -1262,8 +1341,8 @@ if (!is.null(cv_results$inla_results) && length(cv_results$inla_results$fold_res
      for (i in 1:length(cv_results$inla_results$fold_results)) {
       fold <- cv_results$inla_results$fold_results[[i]]
        if (!is.null(fold)) {
-           cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n", # Removed block_id reference
-                    fold$fold, fold$test_mae, fold$test_mse, fold$test_rmse))
+           cat(sprintf("Fold %d: Test MAE = %.4f, Test MSE = %.4f, Test RMSE = %.4f\n",
+                    fold$fold, fold$test_mae %||% NA, fold$test_mse %||% NA, fold$test_rmse %||% NA))
        }
     }
 
@@ -1275,9 +1354,9 @@ if (!is.null(cv_results$inla_results) && length(cv_results$inla_results$fold_res
     cat(sprintf("Mean MAE: %.4f\n", inla_mean_mae))
     cat(sprintf("Mean MSE: %.4f\n", inla_mean_mse))
     cat(sprintf("Mean RMSE: %.4f\n", inla_mean_rmse))
-    cat(sprintf("Overall MAE: %.4f\n", cv_results$inla_results$overall_mae))
-    cat(sprintf("Overall MSE: %.4f\n", cv_results$inla_results$overall_mse))
-    cat(sprintf("Overall RMSE: %.4f\n", cv_results$inla_results$overall_rmse))
+    cat(sprintf("Overall MAE: %.4f\n", cv_results$inla_results$overall_mae %||% NA))
+    cat(sprintf("Overall MSE: %.4f\n", cv_results$inla_results$overall_mse %||% NA))
+    cat(sprintf("Overall RMSE: %.4f\n", cv_results$inla_results$overall_rmse %||% NA))
 } else {
     cat("INLA results are not available.\n")
     inla_mean_mae <- NA; inla_mean_mse <- NA; inla_mean_rmse <- NA
@@ -1286,7 +1365,9 @@ if (!is.null(cv_results$inla_results) && length(cv_results$inla_results$fold_res
 # ---------------------------------
 
 # Compare the models
-cat("\n==== Model Comparison (Borough Fold CV) ====\n") # Updated title
+cat("\n==== Model Comparison (Stratified 5-Fold CV) ====\n") # Updated title
+# Helper for default NA if not already defined
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 # Use results stored earlier, which handle NAs if models failed
 comparison_df <- data.frame(
   Model = c("CARBayes", "SEM Poisson", "INLA"),
@@ -1297,33 +1378,31 @@ comparison_df <- data.frame(
   Overall_MSE = c(cv_results$carbayes_results$overall_mse %||% NA, cv_results$sem_results$overall_mse %||% NA, cv_results$inla_results$overall_mse %||% NA),
   Overall_RMSE = c(cv_results$carbayes_results$overall_rmse %||% NA, cv_results$sem_results$overall_rmse %||% NA, cv_results$inla_results$overall_rmse %||% NA)
 )
-# Helper for default NA
-`%||%` <- function(a, b) if (!is.null(a)) a else b
 
 print(comparison_df)
 
 # After running cross-validation, generate and display the figures
-cat("\nGenerating prediction comparison figures from borough-fold cross-validation results...\n")
-# Pass the data with fold assignments to the figure function if it needs it for context
-figures <- generate_cv_figures(cv_results, data_with_folds)
+cat("\nGenerating prediction comparison figures from stratified cross-validation results...\n") # Updated message
+# Pass the data with assignments to the figure function
+figures <- generate_cv_figures(cv_results, data_with_assignments) # Use updated variable name
 
 # Save the figures (check if plots were generated)
 if (!is.null(figures$map_plot)) {
-    ggsave("predicted_accidents_map_borough_cv.png", figures$map_plot, width = 10, height = 8) # Updated filename
-    cat("Map plot saved as 'predicted_accidents_map_borough_cv.png'\n")
+    ggsave("predicted_accidents_map_stratified_cv.png", figures$map_plot, width = 10, height = 8) # Updated filename
+    cat("Map plot saved as 'predicted_accidents_map_stratified_cv.png'\n")
 } else {
     cat("Map plot could not be generated.\n")
 }
 if (!is.null(figures$scatter_plot)) {
-    ggsave("predicted_vs_actual_borough_cv.png", figures$scatter_plot, width = 8, height = 6) # Updated filename
-    cat("Scatter plot saved as 'predicted_vs_actual_borough_cv.png'\n")
+    ggsave("predicted_vs_actual_stratified_cv.png", figures$scatter_plot, width = 8, height = 6) # Updated filename
+    cat("Scatter plot saved as 'predicted_vs_actual_stratified_cv.png'\n")
 } else {
     cat("Scatter plot could not be generated.\n")
 }
 
 
 # Display summary statistics of predictions if available
-if (nrow(figures$predictions) > 0) {
+if (!is.null(figures$predictions) && nrow(figures$predictions) > 0 && "predicted" %in% colnames(figures$predictions)) { # Check predictions exist
     cat("\nSummary of predictions (CARBayes):\n")
     print(summary(figures$predictions$predicted))
     cat("\nSummary of actual values (corresponding to predictions):\n")
@@ -1332,9 +1411,17 @@ if (nrow(figures$predictions) > 0) {
     # Calculate additional metrics if possible
     if(length(figures$predictions$actual) > 1 && length(figures$predictions$predicted) > 1) {
         cat("\nAdditional metrics (CARBayes):\n")
-        correlation <- cor(figures$predictions$actual, figures$predictions$predicted)
-        cat(sprintf("Correlation: %.4f\n", correlation))
-        cat(sprintf("R-squared: %.4f\n", correlation^2))
+        # Ensure no NAs before correlation calculation
+        valid_preds <- !is.na(figures$predictions$predicted)
+        valid_actual <- !is.na(figures$predictions$actual)
+        valid_both <- valid_preds & valid_actual
+        if(sum(valid_both) > 1) {
+            correlation <- cor(figures$predictions$actual[valid_both], figures$predictions$predicted[valid_both])
+            cat(sprintf("Correlation: %.4f\n", correlation))
+            cat(sprintf("R-squared: %.4f\n", correlation^2))
+        } else {
+            cat("Not enough valid data points to calculate correlation.\n")
+        }
     }
 } else {
     cat("\nNo valid predictions available to summarize.\n")
@@ -1342,7 +1429,7 @@ if (nrow(figures$predictions) > 0) {
 
 
 # Create and save the CARBayes predictions CSV
-cat("\nCreating and saving CARBayes predictions CSV (Borough Fold CV)...\n") # Updated message
+cat("\nCreating and saving CARBayes predictions CSV (Stratified 5-Fold CV)...\n") # Updated message
 # Retrieve the combined IDs and predictions
 pred_ids <- cv_results$carbayes_results$test_ids
 pred_values <- cv_results$carbayes_results$test_predicted
@@ -1361,8 +1448,8 @@ if (length(pred_ids) > 0 && length(pred_ids) == length(pred_values)) {
     predictions_df <- predictions_df[order(predictions_df$predicted_accidents, decreasing = TRUE), ]
 
     # Write to CSV
-    write.csv(predictions_df, "carbayes_predictions_borough_cv.csv", row.names = FALSE) # Updated filename
-    cat("CARBayes predictions saved to carbayes_predictions_borough_cv.csv\n")
+    write.csv(predictions_df, "carbayes_predictions_stratified_cv.csv", row.names = FALSE) # Updated filename
+    cat("CARBayes predictions saved to carbayes_predictions_stratified_cv.csv\n")
 } else {
     cat("No valid CARBayes predictions to save.\n")
 }
