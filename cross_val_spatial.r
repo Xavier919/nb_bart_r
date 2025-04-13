@@ -246,7 +246,7 @@ carbayes_model <- R6::R6Class(
         burnin = 2000,
         n.sample = 5000,
         thin = 2,
-        #rho = 0.8,
+        #rho = 0,
         verbose = TRUE
       )
 

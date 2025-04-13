@@ -873,7 +873,11 @@ generate_carbayes_figures <- function(carbayes_output, full_data) {
 
   # --- Figure 8: Moran's I Test and Plot for Residuals ---
   # Note: Moran plot is saved directly, not returned as ggplot object
-  moran_plot_path <- file.path("results", "moran_plot_residuals_full_data.png")
+  random_effect_name <- carbayes_output$model_object$random_effect
+  moran_plot_path <- file.path("results", paste0("moran_plot_residuals_", 
+                                                ifelse(is.null(random_effect_name), 
+                                                      "without_re", "with_re"), 
+                                                ".png"))
   plots_list$moran_plot_path <- NULL # Initialize path as NULL
 
   if (!is.null(W_matrix) && nrow(plot_data_res) > 0) { # Use plot_data_res which has NA residuals removed
@@ -1022,11 +1026,15 @@ run_and_compare_models <- function(data, response_var = "acc", random_effect = "
     max_features = max_features
   )
   
-  # Generate figures ONLY for model WITH random effect
+  # Generate figures for model WITH random effect
   cat("\n--- Generating Figures for Model WITH Random Effect ---\n")
   figures_with_re <- generate_carbayes_figures(carbayes_with_re, data)
   
-  # Save figures ONLY for model WITH random effect
+  # Generate figures for model WITHOUT random effect
+  cat("\n--- Generating Figures for Model WITHOUT Random Effect ---\n")
+  figures_without_re <- generate_carbayes_figures(carbayes_without_re, data)
+  
+  # Save figures for model WITH random effect
   cat("\n--- Saving Figures for Model WITH Random Effect ---\n")
 
   # Create results directory if it doesn't exist
@@ -1044,6 +1052,36 @@ run_and_compare_models <- function(data, response_var = "acc", random_effect = "
   save_plot_safe(figures_with_re$map_phi, "phi_map_with_re.png", width = 10, height = 8)
   save_plot_safe(figures_with_re$plot_res_fitted, "residuals_vs_fitted_with_re.png", width = 8, height = 6)
   
+  # Save plots for model WITHOUT random effect
+  cat("\n--- Saving Figures for Model WITHOUT Random Effect ---\n")
+  save_plot_safe(figures_without_re$scatter_obs_fitted, "observed_vs_fitted_without_re.png", width = 8, height = 6)
+  save_plot_safe(figures_without_re$map_weights, "spatial_weights_map_without_re.png", width = 10, height = 10)
+  save_plot_safe(figures_without_re$plot_coefficients, "coefficients_plot_without_re.png", 
+            width = 8, height = max(4, length(figures_without_re$plot_coefficients$data$Parameter) * 0.3), 
+            limitsize = FALSE)
+  save_plot_safe(figures_without_re$map_residuals, "residuals_map_without_re.png", width = 10, height = 8)
+  save_plot_safe(figures_without_re$map_phi, "phi_map_without_re.png", width = 10, height = 8)
+  save_plot_safe(figures_without_re$plot_res_fitted, "residuals_vs_fitted_without_re.png", width = 8, height = 6)
+  
+  # Ensure Moran plots are generated for both models
+  # For model WITH random effect
+  if (is.null(figures_with_re$moran_plot_path)) {
+    cat("\n--- Generating Moran Plot for Model WITH Random Effect ---\n")
+    # Create Moran plot for model WITH random effect
+    create_moran_plot(carbayes_with_re, data, "moran_plot_residuals_with_re.png")
+  } else {
+    cat("\nMoran plot for model WITH random effect already generated at:", figures_with_re$moran_plot_path, "\n")
+  }
+  
+  # For model WITHOUT random effect
+  if (is.null(figures_without_re$moran_plot_path)) {
+    cat("\n--- Generating Moran Plot for Model WITHOUT Random Effect ---\n")
+    # Create Moran plot for model WITHOUT random effect
+    create_moran_plot(carbayes_without_re, data, "moran_plot_residuals_without_re.png")
+  } else {
+    cat("\nMoran plot for model WITHOUT random effect already generated at:", figures_without_re$moran_plot_path, "\n")
+  }
+  
   # Compare model performance
   cat("\n==== Model Comparison ====\n")
   
@@ -1056,6 +1094,103 @@ run_and_compare_models <- function(data, response_var = "acc", random_effect = "
   )
   print(metrics_df)
   
+  # Print spatial parameters (rho and tau2)
+  cat("\n--- Spatial Parameters Estimates ---\n")
+  
+  # For model WITH random effect
+  cat("Model WITH Random Effect:\n")
+  if (!is.null(carbayes_with_re$model_object$results$summary.results)) {
+    summary_with_re <- as.data.frame(carbayes_with_re$model_object$results$summary.results)
+    
+    # Extract rho (spatial autocorrelation parameter)
+    if ("rho" %in% rownames(summary_with_re)) {
+      rho_with_re <- summary_with_re["rho", ]
+      cat("rho (spatial autocorrelation):\n")
+      print(rho_with_re)
+      cat("\n")
+    } else {
+      cat("rho parameter not found in model results\n")
+    }
+    
+    # Extract tau2 (variance parameter)
+    if ("tau2" %in% rownames(summary_with_re)) {
+      tau2_with_re <- summary_with_re["tau2", ]
+      cat("tau2 (variance parameter):\n")
+      print(tau2_with_re)
+      cat("\n")
+    } else {
+      cat("tau2 parameter not found in model results\n")
+    }
+    
+    # Print interpretation of rho
+    if ("rho" %in% rownames(summary_with_re)) {
+      rho_mean <- summary_with_re["rho", "Mean"]
+      cat("Interpretation of rho (", rho_mean, "):\n", sep="")
+      if (rho_mean > 0.8) {
+        cat("- Strong spatial autocorrelation (rho > 0.8)\n")
+        cat("- The spatial component is highly important in this model\n")
+      } else if (rho_mean > 0.5) {
+        cat("- Moderate spatial autocorrelation (0.5 < rho < 0.8)\n")
+        cat("- The spatial component plays a significant role in this model\n")
+      } else if (rho_mean > 0.2) {
+        cat("- Weak spatial autocorrelation (0.2 < rho < 0.5)\n")
+        cat("- The spatial component has some influence in this model\n")
+      } else {
+        cat("- Very weak or no spatial autocorrelation (rho < 0.2)\n")
+        cat("- The spatial component has minimal influence in this model\n")
+      }
+    }
+  } else {
+    cat("Summary results not available for model WITH random effect\n")
+  }
+  
+  # For model WITHOUT random effect
+  cat("\nModel WITHOUT Random Effect:\n")
+  if (!is.null(carbayes_without_re$model_object$results$summary.results)) {
+    summary_without_re <- as.data.frame(carbayes_without_re$model_object$results$summary.results)
+    
+    # Extract rho (spatial autocorrelation parameter)
+    if ("rho" %in% rownames(summary_without_re)) {
+      rho_without_re <- summary_without_re["rho", ]
+      cat("rho (spatial autocorrelation):\n")
+      print(rho_without_re)
+      cat("\n")
+    } else {
+      cat("rho parameter not found in model results\n")
+    }
+    
+    # Extract tau2 (variance parameter)
+    if ("tau2" %in% rownames(summary_without_re)) {
+      tau2_without_re <- summary_without_re["tau2", ]
+      cat("tau2 (variance parameter):\n")
+      print(tau2_without_re)
+      cat("\n")
+    } else {
+      cat("tau2 parameter not found in model results\n")
+    }
+    
+    # Print interpretation of rho
+    if ("rho" %in% rownames(summary_without_re)) {
+      rho_mean <- summary_without_re["rho", "Mean"]
+      cat("Interpretation of rho (", rho_mean, "):\n", sep="")
+      if (rho_mean > 0.8) {
+        cat("- Strong spatial autocorrelation (rho > 0.8)\n")
+        cat("- The spatial component is highly important in this model\n")
+      } else if (rho_mean > 0.5) {
+        cat("- Moderate spatial autocorrelation (0.5 < rho < 0.8)\n")
+        cat("- The spatial component plays a significant role in this model\n")
+      } else if (rho_mean > 0.2) {
+        cat("- Weak spatial autocorrelation (0.2 < rho < 0.5)\n")
+        cat("- The spatial component has some influence in this model\n")
+      } else {
+        cat("- Very weak or no spatial autocorrelation (rho < 0.2)\n")
+        cat("- The spatial component has minimal influence in this model\n")
+      }
+    }
+  } else {
+    cat("Summary results not available for model WITHOUT random effect\n")
+  }
+  
   # Moran's I test results
   cat("\n--- Moran's I Test Results ---\n")
   cat("Model WITH Random Effect:\n")
@@ -1065,87 +1200,11 @@ run_and_compare_models <- function(data, response_var = "acc", random_effect = "
     cat("Moran's I test result not available\n")
   }
   
-  # Manual LRT calculation
-  cat("\n--- Manual Likelihood Ratio Test ---\n")
-  if (!is.null(carbayes_with_re$model_object$results) && !is.null(carbayes_without_re$model_object$results)) {
-    # Extract deviance values (which are -2*log-likelihood)
-    if ("deviance" %in% names(carbayes_with_re$model_object$results$modelfit) && 
-        "deviance" %in% names(carbayes_without_re$model_object$results$modelfit)) {
-      
-      # Get deviance values
-      dev_with_re <- carbayes_with_re$model_object$results$modelfit["deviance"]
-      dev_without_re <- carbayes_without_re$model_object$results$modelfit["deviance"]
-      
-      # Calculate log-likelihoods from deviance (-deviance/2)
-      ll_with_re <- -dev_with_re/2
-      ll_without_re <- -dev_without_re/2
-      
-      # Calculate LRT statistic
-      lrt_stat <- 2 * (ll_with_re - ll_without_re)
-      
-      # Degrees of freedom - number of random effect levels minus 1
-      if (!is.null(carbayes_with_re$model_object$data_with_re[[random_effect]])) {
-        df <- length(levels(carbayes_with_re$model_object$data_with_re[[random_effect]])) - 1
-      } else {
-        df <- 1 # Default if we can't determine the number of levels
-      }
-      
-      # Calculate p-value
-      p_value <- pchisq(lrt_stat, df = df, lower.tail = FALSE)
-      
-      cat("Deviance (with RE):", dev_with_re, "\n")
-      cat("Deviance (without RE):", dev_without_re, "\n")
-      cat("Log-likelihood (with RE):", ll_with_re, "\n")
-      cat("Log-likelihood (without RE):", ll_without_re, "\n")
-      cat("LRT statistic:", lrt_stat, "\n")
-      cat("Degrees of freedom:", df, "\n")
-      cat("p-value:", p_value, "\n")
-      
-      if (p_value < 0.05) {
-        cat("Conclusion: The random effect on borough is statistically significant (p < 0.05).\n")
-      } else {
-        cat("Conclusion: The random effect on borough is not statistically significant (p >= 0.05).\n")
-      }
-    } else {
-      cat("Deviance values not found in model results. Cannot perform manual LRT.\n")
-      
-      # Try to find other ways to get log-likelihood
-      if ("loglikelihood" %in% rownames(as.data.frame(carbayes_with_re$model_object$results$summary.results)) &&
-          "loglikelihood" %in% rownames(as.data.frame(carbayes_without_re$model_object$results$summary.results))) {
-        
-        ll_with_re <- as.data.frame(carbayes_with_re$model_object$results$summary.results)["loglikelihood", "Mean"]
-        ll_without_re <- as.data.frame(carbayes_without_re$model_object$results$summary.results)["loglikelihood", "Mean"]
-        
-        # Calculate LRT statistic
-        lrt_stat <- 2 * (ll_with_re - ll_without_re)
-        
-        # Degrees of freedom
-        if (!is.null(carbayes_with_re$model_object$data_with_re[[random_effect]])) {
-          df <- length(levels(carbayes_with_re$model_object$data_with_re[[random_effect]])) - 1
-        } else {
-          df <- 1
-        }
-        
-        # Calculate p-value
-        p_value <- pchisq(lrt_stat, df = df, lower.tail = FALSE)
-        
-        cat("Log-likelihood from summary (with RE):", ll_with_re, "\n")
-        cat("Log-likelihood from summary (without RE):", ll_without_re, "\n")
-        cat("LRT statistic:", lrt_stat, "\n")
-        cat("Degrees of freedom:", df, "\n")
-        cat("p-value:", p_value, "\n")
-        
-        if (p_value < 0.05) {
-          cat("Conclusion: The random effect on borough is statistically significant (p < 0.05).\n")
-        } else {
-          cat("Conclusion: The random effect on borough is not statistically significant (p >= 0.05).\n")
-        }
-      } else {
-        cat("Could not find log-likelihood values in any standard location. Manual LRT cannot be performed.\n")
-      }
-    }
+  cat("\nModel WITHOUT Random Effect:\n")
+  if (!is.null(figures_without_re$moran_test_result)) {
+    print(figures_without_re$moran_test_result)
   } else {
-    cat("Cannot perform manual LRT: Model results not available\n")
+    cat("Moran's I test result not available\n")
   }
   
   # DIC comparison
@@ -1170,18 +1229,112 @@ run_and_compare_models <- function(data, response_var = "acc", random_effect = "
     cat("Cannot compare DIC: Values not available\n")
   }
   
-  # Add this before the LRT section
-  cat("Model with RE structure:\n")
-  str(carbayes_with_re$model_object$results$modelfit, max.level=1)
-  cat("Model without RE structure:\n")
-  str(carbayes_without_re$model_object$results$modelfit, max.level=1)
-  
-  # Return both model outputs but only figures for WITH random effect
+  # Return both model outputs and figures
   return(list(
     with_re = carbayes_with_re,
     without_re = carbayes_without_re,
-    figures_with_re = figures_with_re
+    figures_with_re = figures_with_re,
+    figures_without_re = figures_without_re
   ))
+}
+
+# Add a dedicated function to create Moran plots
+create_moran_plot <- function(model_output, full_data, filename) {
+  if (is.null(model_output) || is.null(model_output$model_object) || is.null(model_output$predictions)) {
+    warning("Model output, model object, or predictions are missing. Cannot generate Moran plot.")
+    return(NULL)
+  }
+  
+  # Create results directory if it doesn't exist
+  if (!dir.exists("results")) {
+    dir.create("results")
+  }
+  
+  # Full path for saving
+  moran_plot_path <- file.path("results", filename)
+  
+  # Get predictions and merge with spatial data
+  predictions_df <- model_output$predictions
+  plot_data <- merge(full_data[, c("int_no", "x", "y")], predictions_df, by = "int_no", all.x = TRUE)
+  
+  # Calculate residuals
+  plot_data$residuals <- plot_data$actual - plot_data$predicted
+  
+  # Remove rows with NA coordinates or residuals
+  plot_data_res <- plot_data[!is.na(plot_data$x) & !is.na(plot_data$y) & !is.na(plot_data$residuals), ]
+  
+  # Get spatial weights matrix
+  W_matrix <- model_output$model_object$W
+  
+  if (!is.null(W_matrix) && nrow(plot_data_res) > 0) {
+    residuals_vec <- plot_data_res$residuals
+    
+    # Find indices of plot_data_res within full_data
+    valid_indices <- match(plot_data_res$int_no, full_data$int_no)
+    valid_indices <- valid_indices[!is.na(valid_indices)] # Remove NAs if any int_no wasn't found
+
+    if(length(valid_indices) == length(residuals_vec) && length(valid_indices) > 1) {
+      W_subset <- W_matrix[valid_indices, valid_indices]
+      
+      if (!isSymmetric(W_subset)) {
+        warning("W subset is not symmetric, symmetrizing for Moran's I.")
+        W_subset <- (W_subset + t(W_subset)) / 2
+      }
+      
+      no_neighbor_rows <- which(rowSums(W_subset) == 0)
+      listw_obj <- NULL
+      residuals_vec_moran <- residuals_vec
+
+      if (length(no_neighbor_rows) > 0) {
+        warning(paste("Found", length(no_neighbor_rows), "locations with no neighbors in W subset. Excluding for Moran's I."), call. = FALSE)
+        if(length(no_neighbor_rows) < nrow(W_subset)) {
+          residuals_vec_moran <- residuals_vec[-no_neighbor_rows]
+          W_subset_moran <- W_subset[-no_neighbor_rows, -no_neighbor_rows]
+          listw_obj <- tryCatch(mat2listw(W_subset_moran, style = "W"), error = function(e) {cat("Error creating listw (subset):", e$message, "\n"); NULL})
+        } else {
+          cat("All points are isolates after subsetting. Cannot perform Moran's I.\n")
+        }
+      } else {
+        listw_obj <- tryCatch(mat2listw(W_subset, style = "W"), error = function(e) {cat("Error creating listw (full subset):", e$message, "\n"); NULL})
+      }
+
+      if (!is.null(listw_obj)) {
+        # Perform Moran's I test
+        moran_test_result <- tryCatch(
+          moran.test(residuals_vec_moran, listw = listw_obj, randomisation = TRUE),
+          error = function(e) {cat("Error during Moran's I test:", e$message, "\n"); NULL}
+        )
+        if (!is.null(moran_test_result)) {
+          cat("\nMoran's I Test Result:\n")
+          print(moran_test_result)
+        }
+        
+        # Create Moran scatter plot
+        cat("\nGenerating Moran Scatter Plot...\n")
+        png(moran_plot_path, width = 6, height = 6, units = "in", res = 300)
+        tryCatch({
+          moran.plot(residuals_vec_moran, listw = listw_obj,
+                     main = "Moran Scatter Plot for Model Residuals",
+                     xlab = "Residuals", ylab = "Spatially Lagged Residuals")
+        }, error = function(e) {
+          cat("Error generating Moran plot:", e$message, "\n")
+          plot(1, type="n", axes=FALSE, xlab="", ylab=""); title("Moran Plot Failed") # Blank plot on error
+        }, finally = {
+          dev.off()
+        })
+        cat(paste("Saved Moran scatter plot to", moran_plot_path, "\n"))
+        return(moran_plot_path)
+      } else {
+        cat("Skipping Moran's I test and plot due to issues creating listw object.\n")
+      }
+    } else {
+      warning("Index mismatch or insufficient data for Moran's I calculation.")
+    }
+  } else {
+    warning("W matrix or residuals missing for Moran's I test/plot.")
+  }
+  
+  return(NULL)
 }
 
 # Run both models and compare them
