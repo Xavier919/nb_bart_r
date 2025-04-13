@@ -84,6 +84,7 @@ load_and_prepare_data <- function() {
   full_data <- cbind(data[, id_cols], X_base, X_spatial)
   
   full_data$idx_spatial <- 1:nrow(full_data)
+
   
   return(full_data)
 }

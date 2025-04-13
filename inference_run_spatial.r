@@ -561,7 +561,7 @@ train_and_evaluate_carbayes <- function(data, response_var = "acc", random_effec
   cat("--- Training CARBayes Model on Full Dataset ---\n")
   # Create spatial weights from the full dataset
   if(nrow(data) > 3 && !any(is.na(data$x)) && !any(is.na(data$y))) {
-      W_full <- create_spatial_weights(data[, c('x', 'y')], k_neighbors = 5)
+      W_full <- create_spatial_weights(data[, c('x', 'y')], k_neighbors = 10)
   } else {
       cat("Error: Insufficient data or NA coordinates in the dataset for CARBayes weights. Aborting.\n")
       return(NULL) # Cannot proceed without weights
