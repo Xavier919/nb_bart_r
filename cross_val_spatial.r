@@ -98,12 +98,14 @@ create_spatial_weights <- function(data, k_neighbors = 10) {
   for (i in 1:n) {
     for (j in 2:(k_neighbors + 1)) {
       idx <- nn$nn.index[i, j]
-      dist <- nn$nn.dist[i, j]
-      W[i, idx] <- 1.0 / max(dist, 0.0001)
+      # Use binary weights (1 if in k-neighbors, 0 otherwise)
+      W[i, idx] <- 1
     }
   }
   
-  W_symmetric <- (W + t(W)) / 2
+  # Symmetrize by taking maximum between W and t(W)
+  # This ensures that if either point considers the other a neighbor, they are connected
+  W_symmetric <- pmax(W, t(W))
   return(W_symmetric)
 }
 
@@ -761,8 +763,8 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     cat("--- Training CARBayes Model ---\n")
     # Create spatial weights ONLY from training data
     # Check for sufficient points and valid coordinates before creating weights
-    if(nrow(train_data) > 3 && !any(is.na(train_data$x)) && !any(is.na(train_data$y))) {
-        W_train_car <- create_spatial_weights(train_data[, c('x', 'y')], k_neighbors = 3)
+    if(nrow(train_data) > 20 && !any(is.na(train_data$x)) && !any(is.na(train_data$y))) {
+        W_train_car <- create_spatial_weights(train_data[, c('x', 'y')], k_neighbors = 10)
     } else {
         cat("Warning: Insufficient data or NA coordinates in training set for CARBayes weights. Skipping CARBayes for fold", i, "\n")
         W_train_car <- NULL # Set weights to NULL
@@ -825,8 +827,8 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
 
 
     # Create spatial weights ONLY from training data for SEM model fitting
-    if (!is.null(train_sp) && nrow(train_sp) > 3) { # Need k+1 points for k=3 neighbors
-        w_train_sem <- tryCatch(make_spatial_weights_for_sem(train_sp, k = 3),
+    if (!is.null(train_sp) && nrow(train_sp) > 10) { # Need k+1 points for k=20 neighbors
+        w_train_sem <- tryCatch(make_spatial_weights_for_sem(train_sp, k = 10),
                                 error = function(e) {
                                     cat("Warning: Could not create SEM weights for fold", i, ":", e$message, "\n")
                                     return(NULL)
@@ -873,9 +875,9 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
     # Create sparse spatial weights matrix ONLY from training data
     # Check for sufficient points and valid coordinates
     W_sparse_train_inla <- NULL # Initialize as NULL
-    if(nrow(train_data_inla) > 3 && !any(is.na(train_data_inla$x)) && !any(is.na(train_data_inla$y))) {
+    if(nrow(train_data_inla) > 20 && !any(is.na(train_data_inla$x)) && !any(is.na(train_data_inla$y))) {
         coords_train_inla <- as.matrix(train_data_inla[, c('x', 'y')])
-        W_dense_train_inla <- tryCatch(create_spatial_weights(data.frame(x=coords_train_inla[,1], y=coords_train_inla[,2]), k_neighbors=3),
+        W_dense_train_inla <- tryCatch(create_spatial_weights(data.frame(x=coords_train_inla[,1], y=coords_train_inla[,2]), k_neighbors=10),
                                        error = function(e) {
                                            cat("Warning: Could not create dense weights for INLA in fold", i, ":", e$message, "\n")
                                            return(NULL)
@@ -1019,18 +1021,38 @@ run_combined_cross_validation <- function(data, response_var = "acc", random_eff
                 coords_test <- test_data[, c("x", "y")]
 
                 # Find the index of the nearest training point for each test point
-                nn_result <- FNN::get.knnx(coords_train, coords_test, k = 1)
-                nearest_train_indices <- nn_result$nn.index[, 1]
-
+                nn_result <- FNN::get.knnx(coords_train, coords_test, k = 10)
+                nearest_train_indices <- nn_result$nn.index
+                
                 # Get the fitted spatial effects (combined BYM2 effect) for training points
                 spatial_effects_train <- inla_model$summary.random$idx_train_spatial$mean
-
+                
                 # Ensure lengths match before indexing
                 if(length(spatial_effects_train) == nrow(train_data_inla)) {
-                     # Map the nearest training index to its spatial effect
-                     eta_spatial_approx <- spatial_effects_train[nearest_train_indices]
-                     eta_spatial_approx[is.na(eta_spatial_approx)] <- 0 # Handle potential NAs
-                     cat("Applied nearest neighbor spatial effect approximation for INLA prediction.\n")
+                     # Calculate distances for inverse distance weighting
+                     distances <- nn_result$nn.dist
+                     
+                     # Apply IDW for each test point using 20 nearest neighbors
+                     for(i in 1:nrow(test_data)) {
+                         # Get indices and distances for current test point
+                         neighbor_indices <- nearest_train_indices[i,]
+                         neighbor_distances <- distances[i,]
+                         
+                         # Handle zero distances (exact matches)
+                         zero_dist_idx <- which(neighbor_distances < 1e-9)
+                         if(length(zero_dist_idx) > 0) {
+                             # Use the effect of the first exact match
+                             eta_spatial_approx[i] <- spatial_effects_train[neighbor_indices[zero_dist_idx[1]]]
+                         } else {
+                             # Apply inverse distance weighting
+                             weights <- 1 / neighbor_distances
+                             weights <- weights / sum(weights) # Normalize weights
+                             
+                             # Weighted average of spatial effects
+                             eta_spatial_approx[i] <- sum(spatial_effects_train[neighbor_indices] * weights, na.rm = TRUE)
+                         }
+                     }
+                     cat("Applied inverse distance weighted spatial effect approximation (k=10) for INLA prediction.\n")
                 } else {
                      warning("Could not apply nearest neighbor spatial effect: Mismatch between spatial effects length and training data size.")
                 }

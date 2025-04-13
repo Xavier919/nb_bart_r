@@ -87,7 +87,7 @@ load_and_prepare_data <- function() {
   return(full_data)
 }
 
-create_spatial_weights <- function(data, k_neighbors = 5) {
+create_spatial_weights <- function(data, k_neighbors = 10) {
   coords <- as.matrix(data[, c('x', 'y')])
   n <- nrow(coords)
   
@@ -97,12 +97,14 @@ create_spatial_weights <- function(data, k_neighbors = 5) {
   for (i in 1:n) {
     for (j in 2:(k_neighbors + 1)) {
       idx <- nn$nn.index[i, j]
-      dist <- nn$nn.dist[i, j]
-      W[i, idx] <- 1.0 / max(dist, 0.0001)
+      # Use binary weights (1 if in k-neighbors, 0 otherwise)
+      W[i, idx] <- 1
     }
   }
   
-  W_symmetric <- (W + t(W)) / 2
+  # Symmetrize by taking maximum between W and t(W)
+  # This ensures that if either point considers the other a neighbor, they are connected
+  W_symmetric <- pmax(W, t(W))
   return(W_symmetric)
 }
 
@@ -399,7 +401,7 @@ carbayes_model <- R6::R6Class(
 
                     if (sum(valid_train_coords) > 0 && sum(valid_test_coords) > 0) {
                         # Find k nearest *valid* training points for each *valid* test point
-                        k_interp <- 5 # Number of neighbors for interpolation
+                        k_interp <- 10 # Number of neighbors for interpolation
                         nn_result <- FNN::get.knnx(
                             coords_train[valid_train_coords, , drop = FALSE],
                             coords_test[valid_test_coords, , drop = FALSE],
@@ -559,7 +561,7 @@ train_and_evaluate_carbayes <- function(data, response_var = "acc", random_effec
   cat("--- Training CARBayes Model on Full Dataset ---\n")
   # Create spatial weights from the full dataset
   if(nrow(data) > 3 && !any(is.na(data$x)) && !any(is.na(data$y))) {
-      W_full <- create_spatial_weights(data[, c('x', 'y')], k_neighbors = 3)
+      W_full <- create_spatial_weights(data[, c('x', 'y')], k_neighbors = 5)
   } else {
       cat("Error: Insufficient data or NA coordinates in the dataset for CARBayes weights. Aborting.\n")
       return(NULL) # Cannot proceed without weights
@@ -735,7 +737,7 @@ generate_carbayes_figures <- function(carbayes_output, full_data) {
           weights_plot <- ggplot() +
             geom_segment(data = links, aes(x = x_start, y = y_start, xend = x_end, yend = y_end, color = weight), alpha = 0.5) +
             geom_point(data = coords_for_weights, aes(x = x, y = y), size = 0.5, color = "black") +
-            scale_color_viridis_c(option = "plasma", name = "Spatial Weight\n(Inverse Distance)") +
+            scale_color_viridis_c(option = "plasma", name = "Spatial Weight\n(Binary weights)") +
             labs(title = "Intersection Map with Spatial Links",
                  subtitle = paste("Links based on k=", carbayes_output$model_object$W_list$num[1] %||% "unknown", " nearest neighbors"), # Attempt to get k
                  x = "X Coordinate", y = "Y Coordinate") +
