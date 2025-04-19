@@ -1320,7 +1320,8 @@ create_moran_plot <- function(model_output, full_data, filename) {
                      xlab = "Residuals", ylab = "Spatially Lagged Residuals")
         }, error = function(e) {
           cat("Error generating Moran plot:", e$message, "\n")
-          plot(1, type="n", axes=FALSE, xlab="", ylab=""); title("Moran Plot Failed") # Blank plot on error
+          plot(1, type="n", axes=FALSE, xlab="", ylab="")
+          title("Moran Plot Failed")
         }, finally = {
           dev.off()
         })
@@ -1339,12 +1340,183 @@ create_moran_plot <- function(model_output, full_data, filename) {
   return(NULL)
 }
 
+# Add this function to create a Moran plot for raw data
+create_raw_data_moran_plot <- function(data, response_var = "acc") {
+  cat("\n==== Analyzing Spatial Autocorrelation in Raw Data ====\n")
+  
+  # Check if required columns exist
+  if (!all(c(response_var, "x", "y") %in% colnames(data))) {
+    stop("Required columns missing in data: need response variable, x, and y coordinates")
+  }
+  
+  # Create results directory if it doesn't exist
+  if (!dir.exists("results")) {
+    dir.create("results")
+  }
+  
+  # Full path for saving
+  moran_plot_path <- file.path("results", "moran_plot_raw_data.png")
+  
+  # Filter out rows with NA in response or coordinates
+  valid_data <- data[!is.na(data[[response_var]]) & !is.na(data$x) & !is.na(data$y), ]
+  
+  if (nrow(valid_data) < 10) {
+    stop("Insufficient valid data points for Moran's I analysis")
+  }
+  
+  # Create spatial weights matrix
+  cat("Creating spatial weights matrix for raw data...\n")
+  coords <- as.matrix(valid_data[, c('x', 'y')])
+  W_raw <- create_spatial_weights(valid_data, k_neighbors = 10)
+  
+  # Check if W is valid
+  if (sum(W_raw) == 0) {
+    stop("Invalid weights matrix: all weights are zero")
+  }
+  
+  # Convert to listw object
+  if (!isSymmetric(W_raw)) {
+    warning("W matrix is not symmetric, symmetrizing for Moran's I.")
+    W_raw <- (W_raw + t(W_raw)) / 2
+  }
+  
+  # Check for rows with no neighbors
+  no_neighbor_rows <- which(rowSums(W_raw) == 0)
+  
+  if (length(no_neighbor_rows) > 0) {
+    warning(paste("Found", length(no_neighbor_rows), "locations with no neighbors. Excluding for Moran's I."))
+    if (length(no_neighbor_rows) < nrow(W_raw)) {
+      valid_indices <- setdiff(1:nrow(valid_data), no_neighbor_rows)
+      valid_data <- valid_data[valid_indices, ]
+      W_raw <- W_raw[valid_indices, valid_indices]
+    } else {
+      stop("All points are isolates. Cannot perform Moran's I.")
+    }
+  }
+  
+  # Create listw object
+  listw_obj <- tryCatch(
+    mat2listw(W_raw, style = "W"),
+    error = function(e) {
+      cat("Error creating listw object:", e$message, "\n")
+      NULL
+    }
+  )
+  
+  if (is.null(listw_obj)) {
+    stop("Failed to create listw object")
+  }
+  
+  # Perform Moran's I test
+  cat("Performing Moran's I test on raw data...\n")
+  moran_test_result <- tryCatch(
+    moran.test(valid_data[[response_var]], listw = listw_obj, randomisation = TRUE),
+    error = function(e) {
+      cat("Error during Moran's I test:", e$message, "\n")
+      NULL
+    }
+  )
+  
+  if (!is.null(moran_test_result)) {
+    cat("\nMoran's I Test for Raw Data (", response_var, "):\n", sep="")
+    print(moran_test_result)
+    
+    # Interpret the results
+    cat("\nInterpretation of Moran's I Test:\n")
+    if (moran_test_result$p.value < 0.05) {
+      cat("- Significant spatial autocorrelation detected (p-value < 0.05)\n")
+      if (moran_test_result$estimate[1] > 0) {
+        cat("- Positive spatial autocorrelation: Similar values tend to cluster together\n")
+      } else {
+        cat("- Negative spatial autocorrelation: Dissimilar values tend to be neighbors\n")
+      }
+    } else {
+      cat("- No significant spatial autocorrelation detected (p-value >= 0.05)\n")
+    }
+    
+    # Quantify the strength
+    i_value <- moran_test_result$estimate[1]
+    cat(sprintf("- Moran's I value: %.4f\n", i_value))
+    if (abs(i_value) > 0.5) {
+      cat("- Strong spatial autocorrelation\n")
+    } else if (abs(i_value) > 0.3) {
+      cat("- Moderate spatial autocorrelation\n")
+    } else if (abs(i_value) > 0.1) {
+      cat("- Weak spatial autocorrelation\n")
+    } else {
+      cat("- Very weak or no spatial autocorrelation\n")
+    }
+  }
+  
+  # Create Moran scatter plot
+  cat("\nGenerating Moran Scatter Plot for raw data...\n")
+  png(moran_plot_path, width = 8, height = 8, units = "in", res = 300)
+  tryCatch({
+    moran.plot(valid_data[[response_var]], listw = listw_obj,
+               main = paste("Moran Scatter Plot for Raw", response_var),
+               xlab = response_var, 
+               ylab = paste("Spatially Lagged", response_var))
+    
+    # Add Moran's I value and p-value to the plot if available
+    if (!is.null(moran_test_result)) {
+      legend_text <- c(
+        sprintf("Moran's I: %.4f", moran_test_result$estimate[1]),
+        sprintf("p-value: %.4g", moran_test_result$p.value)
+      )
+      legend("topleft", legend = legend_text, bty = "n", cex = 1.2)
+    }
+  }, error = function(e) {
+    cat("Error generating Moran plot:", e$message, "\n")
+    plot(1, type="n", axes=FALSE, xlab="", ylab="")
+    title("Moran Plot Failed")
+  }, finally = {
+    dev.off()
+  })
+  
+  cat(paste("Saved Moran scatter plot to", moran_plot_path, "\n"))
+  
+  # Create a map of the raw values
+  cat("\nGenerating map of raw values...\n")
+  raw_map_path <- file.path("results", "map_raw_values.png")
+  
+  # Convert to sf object for mapping
+  sp_data <- valid_data
+  coordinates(sp_data) <- ~ x + y
+  sf_data <- st_as_sf(sp_data)
+  
+  # Create the map
+  raw_map <- ggplot() +
+    geom_sf(data = sf_data, aes(color = .data[[response_var]]), size = 2) +
+    scale_color_viridis_c(option = "plasma", name = response_var) +
+    theme_minimal() +
+    labs(title = paste("Spatial Distribution of Raw", response_var),
+         subtitle = "Before any modeling") +
+    theme(panel.background = element_rect(fill = "white", color = NA),
+          plot.background = element_rect(fill = "white", color = NA))
+  
+  # Save the map
+  ggsave(raw_map_path, raw_map, width = 10, height = 8)
+  cat(paste("Saved raw values map to", raw_map_path, "\n"))
+  
+  return(list(
+    moran_test = moran_test_result,
+    moran_plot_path = moran_plot_path,
+    raw_map_path = raw_map_path
+  ))
+}
+
 # Run both models and compare them
 model_comparison <- run_and_compare_models(
   data = full_data,
   response_var = "acc",
   random_effect = "borough",
   max_features = 40
+)
+
+# Add this after the model comparison to analyze raw data
+raw_data_spatial_analysis <- create_raw_data_moran_plot(
+  data = full_data,
+  response_var = "acc"
 )
 
 cat("\nScript finished.\n")
