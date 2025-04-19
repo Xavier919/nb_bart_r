@@ -838,7 +838,7 @@ generate_carbayes_figures <- function(carbayes_output, full_data) {
 
           phi_map <- ggplot() +
             geom_sf(data = sf_phi, aes(color = phi_mean), size = 1) +
-            scale_color_viridis_c(option = "viridis", name = "Mean Spatial\nEffect (Phi)") +
+            scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, name = "Mean Spatial\nEffect (Phi)") +
             theme_classic() +
             theme(panel.background = element_rect(fill = "white", color = NA),
                   plot.background = element_rect(fill = "white", color = NA),
