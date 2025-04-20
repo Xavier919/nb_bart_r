@@ -1489,9 +1489,18 @@ if (length(pred_ids) > 0 && length(pred_ids) == length(pred_values)) {
 
     # Sort the data frame by predicted accidents (descending)
     predictions_df <- predictions_df[order(predictions_df$predicted_accidents, decreasing = TRUE), ]
+    
+    # Add rank column (1 being most dangerous)
+    predictions_df$rank <- 1:nrow(predictions_df)
+    
+    # Create final output dataframe with just intersection_id and rank
+    output_df <- data.frame(
+      intersection_id = predictions_df$int_no,
+      rank = predictions_df$rank
+    )
 
     # Write to CSV
-    write.csv(predictions_df, "carbayes_predictions_stratified_cv.csv", row.names = FALSE) # Updated filename
+    write.csv(output_df, "carbayes_predictions_stratified_cv.csv", row.names = FALSE) # Updated filename
     cat("CARBayes predictions saved to carbayes_predictions_stratified_cv.csv\n")
 } else {
     cat("No valid CARBayes predictions to save.\n")
