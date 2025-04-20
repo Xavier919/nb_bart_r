@@ -392,7 +392,7 @@ carbayes_model <- R6::R6Class(
                     warning("Could not apply phi to training data due to length mismatch.")
                 }
             } else {
-                # If predicting on new data, use k-nearest neighbors with inverse distance weighting
+                # If predicting on new data, use simple average of k-nearest neighbors
                 if (!is.null(self$data_with_re) && all(self$spatial_vars %in% colnames(self$data_with_re)) &&
                     all(self$spatial_vars %in% colnames(newdata))) {
 
@@ -424,39 +424,19 @@ carbayes_model <- R6::R6Class(
                             # Get indices of test points with valid coordinates
                             valid_test_indices <- which(valid_test_coords)
 
-                            # Loop through valid test points to calculate IDW
+                            # Loop through valid test points to calculate simple average
                             for (j in 1:length(valid_test_indices)) {
                                 test_idx <- valid_test_indices[j] # Original index in newdata
                                 neighbor_orig_indices <- original_train_indices_matrix[j, ]
-                                distances <- nn_result$nn.dist[j, ]
-
-                                # Handle zero distances - assign infinite weight (effectively becomes nearest neighbor)
-                                zero_dist_idx <- which(distances < 1e-9) # Use a small tolerance
-                                if (length(zero_dist_idx) > 0) {
-                                    # If one or more points have zero distance, use the effect of the first one found
-                                    eta_spatial[test_idx] <- phi_mean[neighbor_orig_indices[zero_dist_idx[1]]]
-                                } else {
-                                    # Apply inverse distance weighting
-                                    weights <- 1 / distances
-                                    weights <- weights / sum(weights) # Normalize weights
-
-                                    # Weighted average of spatial effects
-                                    eta_spatial[test_idx] <- sum(phi_mean[neighbor_orig_indices] * weights, na.rm = TRUE) # Add na.rm for safety
-                                }
+                                
+                                # Simple average of spatial effects from 10 nearest neighbors
+                                eta_spatial[test_idx] <- mean(phi_mean[neighbor_orig_indices], na.rm = TRUE)
                             }
-                            cat("Applied inverse distance weighted spatial effect interpolation (k=", k_interp, ") for CARBayes prediction.\n")
-                        } else {
-                            warning("Could not apply IDW spatial effect: Mismatch between spatial effects length and training data size.")
+                            cat("Applied simple average of spatial effects from", k_interp, "nearest neighbors for CARBayes prediction.\n")
                         }
-                    } else {
-                        warning("Could not apply IDW spatial effect: No valid coordinates found in training or test data.")
                     }
-                } else {
-                    warning("Could not apply IDW spatial effect: Coordinate columns missing or training data unavailable.")
                 }
             }
-        } else {
-            warning("Spatial random effect samples (phi) not found in CARBayes results.")
         }
         # --- End Spatial random effects ---
 
